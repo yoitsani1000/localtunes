@@ -8,9 +8,9 @@
     "userInterfaceStyle": "light",
     "ios": {
       "supportsTablet": true,
-      "bundleIdentifier": "com.yourname.localtunes",
+      "bundleIdentifier": "com.anuragmallick.localtunes",
       "infoPlist": { "UIBackgroundModes": ["audio"] }
-    }
+    },
     "android": {
       "adaptiveIcon": {
         "backgroundColor": "#E6F4FE",
