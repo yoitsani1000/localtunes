@@ -1,0 +1,68 @@
+name: Build unsigned iOS IPA
+
+on:
+  workflow_dispatch:
+    inputs:
+      configuration:
+        description: Release embeds the JS bundle. Debug needs expo-dev-client and Metro.
+        type: choice
+        options:
+          - Release
+          - Debug
+        default: Release
+
+jobs:
+  build:
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install JS dependencies
+        run: npm ci
+
+      - name: Generate the native iOS project
+        run: npx expo prebuild --platform ios --no-install
+
+      - name: Install pods
+        run: cd ios && pod install
+
+      - name: Build without code signing
+        env:
+          CONFIGURATION: ${{ inputs.configuration }}
+        run: |
+          cd ios
+          WORKSPACE=$(ls -d *.xcworkspace | head -n 1)
+          APP_NAME="${WORKSPACE%.xcworkspace}"
+          xcodebuild \
+            -workspace "$WORKSPACE" \
+            -scheme "$APP_NAME" \
+            -configuration "$CONFIGURATION" \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            build
+          echo "APP_NAME=$APP_NAME" >> "$GITHUB_ENV"
+
+      - name: Package the IPA
+        env:
+          CONFIGURATION: ${{ inputs.configuration }}
+        run: |
+          cd ios/build/Build/Products/${CONFIGURATION}-iphoneos
+          rm -rf Payload && mkdir Payload
+          cp -R "${APP_NAME}.app" Payload/
+          zip -qry "$GITHUB_WORKSPACE/app-unsigned.ipa" Payload
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: app-unsigned-ipa
+          path: app-unsigned.ipa
+          retention-days: 14
