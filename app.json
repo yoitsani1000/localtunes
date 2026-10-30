@@ -12,6 +12,7 @@
       "infoPlist": {
         "UIBackgroundModes": ["audio"],
         "UIFileSharingEnabled": true,
+        "LSSupportsOpeningDocumentsInPlace": true,
         "CFBundleDocumentTypes": [
           {
             "CFBundleTypeName": "Audio",

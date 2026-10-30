@@ -30,7 +30,7 @@ import {
   View,
   useWindowDimensions,
 } from 'react-native';
-import type { ListRenderItemInfo, StyleProp, ViewStyle } from 'react-native';
+import type { AlertButton, ListRenderItemInfo, StyleProp, ViewStyle } from 'react-native';
 import { SafeAreaProvider, useSafeAreaInsets } from 'react-native-safe-area-context';
 import { LinearGradient } from 'expo-linear-gradient';
 import { Ionicons } from '@expo/vector-icons';
@@ -56,7 +56,7 @@ import TrackPlayer, {
   useProgress,
   useTrackPlayerEvents,
 } from 'react-native-track-player';
-import type { AddTrack } from 'react-native-track-player';
+import type { AddTrack, Track } from 'react-native-track-player';
 
 /* -------------------------------------------------------------------------- */
 /*  Types and constants                                                       */
@@ -64,6 +64,7 @@ import type { AddTrack } from 'react-native-track-player';
 
 type IconName = ComponentProps<typeof Ionicons>['name'];
 type FilterKey = 'playlists' | 'songs' | 'downloaded';
+type SortKey = 'custom' | 'added' | 'recent' | 'title' | 'artist';
 
 interface LibraryTrack {
   id: string;
@@ -72,12 +73,15 @@ interface LibraryTrack {
   uri: string;
   artwork: string | null;
   liked: boolean;
+  sourceName: string;
 }
 
 interface Playlist {
   id: string;
   name: string;
   trackIds: string[];
+  cover: string | null;
+  sort: SortKey;
 }
 
 interface AccentOption {
@@ -91,7 +95,8 @@ interface IncomingFile {
   uri: string;
   name: string;
   mimeType?: string;
-  mode: 'copy' | 'move';
+  /** copy: copy then delete the source. move: relocate it. keep: copy and leave the source alone. */
+  mode: 'copy' | 'move' | 'keep';
 }
 
 const PALETTE = {
@@ -123,6 +128,9 @@ const METADATA_URI = `${DOC_DIR}tracks_metadata.json`;
 const SKIN_URI = `${DOC_DIR}skin_settings.json`;
 const PLAYLISTS_URI = `${DOC_DIR}playlists.json`;
 const INBOX_URI = `${DOC_DIR}Inbox/`;
+const SONGS_DIR = `${DOC_DIR}Songs/`;
+const ART_DIR = `${DOC_DIR}Artwork/`;
+const LIBRARY_SETTINGS_URI = `${DOC_DIR}library_settings.json`;
 const AUDIO_EXTENSIONS: ReadonlySet<string> = new Set([
   'mp3',
   'm4a',
@@ -133,7 +141,18 @@ const AUDIO_EXTENSIONS: ReadonlySet<string> = new Set([
   'aif',
   'caf',
 ]);
+const IMAGE_EXTENSIONS: ReadonlySet<string> = new Set(['jpg', 'jpeg', 'png', 'webp', 'heic', 'heif']);
 const DEFAULT_ARTIST = 'Unknown Artist';
+
+const SORT_LABELS: Record<SortKey, string> = {
+  custom: 'Custom order',
+  added: 'Import order',
+  recent: 'Recently added',
+  title: 'Title',
+  artist: 'Artist',
+};
+const LIBRARY_SORTS: readonly SortKey[] = ['added', 'recent', 'title', 'artist'];
+const PLAYLIST_SORTS: readonly SortKey[] = ['custom', 'recent', 'title', 'artist'];
 const MAX_PLAYLIST_NAME = 60;
 
 const MINI_PLAYER_HEIGHT = 64;
@@ -254,6 +273,79 @@ function isAudioName(name: string): boolean {
   return match !== null && AUDIO_EXTENSIONS.has(match[1].toLowerCase());
 }
 
+function stripExtension(name: string): string {
+  return name.replace(/\.[A-Za-z0-9]{1,5}$/, '');
+}
+
+function isImageName(name: string): boolean {
+  const match = /\.([A-Za-z0-9]{1,5})$/.exec(name);
+  return match !== null && IMAGE_EXTENSIONS.has(match[1].toLowerCase());
+}
+
+function isSortKey(value: unknown): value is SortKey {
+  return (
+    value === 'custom' ||
+    value === 'added' ||
+    value === 'recent' ||
+    value === 'title' ||
+    value === 'artist'
+  );
+}
+
+/** Lower-case name without extension, so "Song.mp3" and "song.JPG" share a key. */
+function baseKey(name: string): string {
+  return stripExtension(name).replace(/_/g, ' ').replace(/\s+/g, ' ').trim().toLowerCase();
+}
+
+/** URL-safe readable suffix for stored file names, so the Files app shows something useful. */
+function slugSuffix(name: string): string {
+  const slug = stripExtension(name)
+    .normalize('NFKD')
+    .replace(/[^A-Za-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 40);
+  return slug ? `-${slug}` : '';
+}
+
+function trackKeys(track: LibraryTrack): string[] {
+  const keys = [baseKey(track.title), baseKey(`${track.artist} - ${track.title}`)];
+  if (track.sourceName) {
+    keys.push(baseKey(track.sourceName));
+  }
+  return keys;
+}
+
+function addedAtOf(track: LibraryTrack): number {
+  const stamp = Number(track.id.split('-')[0]);
+  return Number.isFinite(stamp) ? stamp : 0;
+}
+
+function compareText(a: string, b: string): number {
+  return a.localeCompare(b, undefined, { sensitivity: 'base', numeric: true });
+}
+
+function sortTracks(list: LibraryTrack[], sort: SortKey): LibraryTrack[] {
+  if (sort === 'custom' || sort === 'added') {
+    return list;
+  }
+  const indexed = list.map((track, index) => ({ track, index }));
+  indexed.sort((a, b) => {
+    let result: number;
+    if (sort === 'recent') {
+      result = addedAtOf(b.track) - addedAtOf(a.track);
+    } else if (sort === 'title') {
+      result = compareText(a.track.title, b.track.title);
+    } else {
+      result = compareText(a.track.artist, b.track.artist) || compareText(a.track.title, b.track.title);
+    }
+    if (result !== 0) {
+      return result;
+    }
+    return sort === 'recent' ? b.index - a.index : a.index - b.index;
+  });
+  return indexed.map((entry) => entry.track);
+}
+
 let trackCounter = 0;
 
 function nextTrackId(): string {
@@ -314,7 +406,13 @@ function persistJson(uri: string, value: unknown): Promise<void> {
   return writeChain;
 }
 
+/** iOS changes the app container path between installs, so keep only what follows Documents/. */
 function rebaseUri(stored: string): string {
+  const marker = '/Documents/';
+  const index = stored.lastIndexOf(marker);
+  if (index >= 0) {
+    return `${DOC_DIR}${stored.slice(index + marker.length)}`;
+  }
   const name = stored.split('/').pop();
   return name ? `${DOC_DIR}${name}` : stored;
 }
@@ -326,6 +424,7 @@ interface StoredTrack {
   uri: string;
   artwork: string | null;
   liked?: boolean;
+  sourceName?: string;
 }
 
 function isStoredTrack(value: unknown): value is StoredTrack {
@@ -399,6 +498,7 @@ async function loadLibrary(): Promise<LibraryTrack[]> {
         uri,
         artwork,
         liked: item.liked === true,
+        sourceName: typeof item.sourceName === 'string' ? item.sourceName : '',
       });
     }
     if (changed) {
@@ -411,7 +511,15 @@ async function loadLibrary(): Promise<LibraryTrack[]> {
   }
 }
 
-function isStoredPlaylist(value: unknown): value is Playlist {
+interface StoredPlaylist {
+  id: string;
+  name: string;
+  trackIds: string[];
+  cover?: unknown;
+  sort?: unknown;
+}
+
+function isStoredPlaylist(value: unknown): value is StoredPlaylist {
   if (typeof value !== 'object' || value === null) {
     return false;
   }
@@ -448,7 +556,21 @@ async function loadPlaylists(validIds: ReadonlySet<string>): Promise<Playlist[]>
       if (trackIds.length !== item.trackIds.length) {
         changed = true;
       }
-      loaded.push({ id: item.id, name: item.name, trackIds });
+      let cover: string | null = null;
+      if (typeof item.cover === 'string' && item.cover) {
+        const candidate = rebaseUri(item.cover);
+        cover = (await fileExists(candidate)) ? candidate : null;
+        if (cover !== item.cover) {
+          changed = true;
+        }
+      }
+      loaded.push({
+        id: item.id,
+        name: item.name,
+        trackIds,
+        cover,
+        sort: isSortKey(item.sort) ? item.sort : 'custom',
+      });
     }
     if (changed && prune) {
       await persistJson(PLAYLISTS_URI, loaded);
@@ -460,8 +582,36 @@ async function loadPlaylists(validIds: ReadonlySet<string>): Promise<Playlist[]>
   }
 }
 
-async function findDroppedAudio(library: LibraryTrack[]): Promise<IncomingFile[]> {
-  const known = new Set(library.map((track) => track.uri));
+async function ensureDirectories(): Promise<void> {
+  for (const directory of [SONGS_DIR, ART_DIR, INBOX_URI]) {
+    try {
+      const info = await FileSystem.getInfoAsync(directory);
+      if (!info.exists) {
+        await FileSystem.makeDirectoryAsync(directory, { intermediates: true });
+      }
+    } catch (error) {
+      console.warn(`Could not prepare ${directory}`, error);
+    }
+  }
+}
+
+/** Audio files and pictures dropped into the app's folder (or the Inbox) but not yet imported. */
+async function findDroppedFiles(
+  library: LibraryTrack[],
+  playlists: Playlist[],
+): Promise<IncomingFile[]> {
+  const known = new Set<string>();
+  for (const track of library) {
+    known.add(track.uri);
+    if (track.artwork) {
+      known.add(track.artwork);
+    }
+  }
+  for (const playlist of playlists) {
+    if (playlist.cover) {
+      known.add(playlist.cover);
+    }
+  }
   const found: IncomingFile[] = [];
   for (const directory of [DOC_DIR, INBOX_URI]) {
     let names: string[];
@@ -472,12 +622,57 @@ async function findDroppedAudio(library: LibraryTrack[]): Promise<IncomingFile[]
     }
     for (const name of names) {
       const uri = `${directory}${name}`;
-      if (isAudioName(name) && !known.has(uri)) {
+      if (known.has(uri)) {
+        continue;
+      }
+      if (isAudioName(name) || isImageName(name)) {
         found.push({ uri, name, mode: 'move' });
       }
     }
   }
   return found;
+}
+
+async function transferFile(file: IncomingFile, destination: string): Promise<void> {
+  if (file.mode === 'move') {
+    await FileSystem.moveAsync({ from: file.uri, to: destination });
+    return;
+  }
+  try {
+    await FileSystem.copyAsync({ from: file.uri, to: destination });
+  } finally {
+    if (file.mode === 'copy') {
+      await removeFile(file.uri);
+    }
+  }
+}
+
+async function importArtwork(image: IncomingFile, ownerId: string): Promise<string | null> {
+  if (!(await fileExists(image.uri))) {
+    return null;
+  }
+  const extension = fileExtension(image.name, image.mimeType, IMAGE_MIME_EXTENSIONS, 'jpg');
+  const destination = `${ART_DIR}${ownerId}-art-${Date.now()}.${extension}`;
+  await transferFile(image, destination);
+  return destination;
+}
+
+async function loadLibrarySort(): Promise<SortKey> {
+  try {
+    if (!(await fileExists(LIBRARY_SETTINGS_URI))) {
+      return 'added';
+    }
+    const parsed: unknown = JSON.parse(await FileSystem.readAsStringAsync(LIBRARY_SETTINGS_URI));
+    if (typeof parsed === 'object' && parsed !== null) {
+      const sort = (parsed as Record<string, unknown>).sort;
+      if (isSortKey(sort) && sort !== 'custom') {
+        return sort;
+      }
+    }
+    return 'added';
+  } catch {
+    return 'added';
+  }
 }
 
 async function loadAccent(): Promise<string | null> {
@@ -650,6 +845,39 @@ async function removeFromQueue(id: string): Promise<void> {
   } catch (error) {
     console.warn('Could not remove from the queue', error);
   }
+}
+
+/** Queues a song after the current one (playNext) or at the end. Returns a short message. */
+async function enqueueTrack(track: LibraryTrack, playNext: boolean): Promise<string> {
+  await setupTrackPlayer();
+  const queue = await TrackPlayer.getQueue();
+  if (queue.length === 0) {
+    await TrackPlayer.add(toPlayerTrack(track));
+    await TrackPlayer.play();
+    return 'Playing now';
+  }
+  const activeIndex = (await TrackPlayer.getActiveTrackIndex()) ?? -1;
+  const existing = queue.findIndex((item) => item.id === track.id);
+  if (existing >= 0 && existing === activeIndex) {
+    return 'Already playing';
+  }
+  if (!playNext) {
+    if (existing >= 0) {
+      return 'Already in the queue';
+    }
+    await TrackPlayer.add(toPlayerTrack(track));
+    return 'Added to queue';
+  }
+  const target = activeIndex + 1;
+  if (existing >= 0) {
+    if (existing === target) {
+      return 'Already playing next';
+    }
+    await TrackPlayer.move(existing, existing > activeIndex ? target : activeIndex);
+    return 'Playing next';
+  }
+  await TrackPlayer.add(toPlayerTrack(track), target);
+  return 'Playing next';
 }
 
 async function reorderUpcoming(library: LibraryTrack[], shuffle: boolean): Promise<void> {
@@ -1388,23 +1616,59 @@ const PlaylistRow = memo(function PlaylistRow({
   );
 });
 
+interface PillProps {
+  icon: IconName;
+  label: string;
+  active?: boolean;
+  onPress: () => void;
+}
+
+function Pill({ icon, label, active = false, onPress }: PillProps) {
+  const { accent } = useTheme();
+  return (
+    <Pressable
+      onPress={onPress}
+      accessibilityRole="button"
+      accessibilityLabel={label}
+      style={({ pressed }) => [
+        styles.plAddButton,
+        active && { borderColor: accent },
+        pressed && styles.pressed,
+      ]}
+    >
+      <Ionicons name={icon} size={18} color={active ? accent : PALETTE.text} />
+      <Text style={[styles.plAddText, active && { color: accent }]}>{label}</Text>
+    </Pressable>
+  );
+}
+
 interface PlaylistHeaderProps {
   playlist: Playlist;
   trackCount: number;
+  cover: string | null;
+  sortLabel: string;
+  reordering: boolean;
   onBack: () => void;
   onPlay: () => void;
   onShuffle: () => void;
   onAddSongs: () => void;
+  onSort: () => void;
+  onReorder: () => void;
   onMore: () => void;
 }
 
 function PlaylistHeader({
   playlist,
   trackCount,
+  cover,
+  sortLabel,
+  reordering,
   onBack,
   onPlay,
   onShuffle,
   onAddSongs,
+  onSort,
+  onReorder,
   onMore,
 }: PlaylistHeaderProps) {
   const { accent, onAccent } = useTheme();
@@ -1428,45 +1692,372 @@ function PlaylistHeader({
           onPress={onMore}
         />
       </View>
+      <View style={styles.plCoverWrap}>
+        <View style={styles.plCoverShadow}>
+          <Artwork uri={cover} size={176} radius={8} iconSize={64} />
+        </View>
+      </View>
       <Text numberOfLines={2} style={styles.plTitle}>
         {playlist.name}
       </Text>
       <Text style={styles.plMeta}>{countLabel(trackCount)}</Text>
-      <View style={styles.plActions}>
-        <Pressable
-          onPress={onAddSongs}
-          accessibilityRole="button"
-          accessibilityLabel="Add songs to this playlist"
-          style={({ pressed }) => [styles.plAddButton, pressed && styles.pressed]}
-        >
-          <Ionicons name="add" size={18} color={PALETTE.text} />
-          <Text style={styles.plAddText}>Add songs</Text>
-        </Pressable>
-        <View style={styles.plPlayGroup}>
-          <IconButton
-            name="shuffle"
-            size={26}
-            color={empty ? '#5A5A5A' : PALETTE.text}
-            label="Shuffle play"
-            onPress={onShuffle}
+      <View style={styles.plPills}>
+        <Pill icon="add" label="Add songs" onPress={onAddSongs} />
+        <Pill icon="swap-vertical" label={sortLabel} onPress={onSort} />
+        {trackCount > 1 ? (
+          <Pill
+            icon={reordering ? 'checkmark' : 'reorder-three'}
+            label={reordering ? 'Done' : 'Reorder'}
+            active={reordering}
+            onPress={onReorder}
           />
-          <Pressable
-            onPress={onPlay}
-            disabled={empty}
-            accessibilityRole="button"
-            accessibilityLabel="Play playlist"
-            style={({ pressed }) => [
-              styles.plPlayButton,
-              { backgroundColor: accent },
-              empty && styles.plPlayDisabled,
-              pressed && styles.wheelPressed,
-            ]}
-          >
-            <Ionicons name="play" size={28} color={onAccent} style={styles.playGlyphNudge} />
-          </Pressable>
-        </View>
+        ) : null}
+      </View>
+      <View style={styles.plPlayGroup}>
+        <IconButton
+          name="shuffle"
+          size={26}
+          color={empty ? '#5A5A5A' : PALETTE.text}
+          label="Shuffle play"
+          onPress={onShuffle}
+        />
+        <Pressable
+          onPress={onPlay}
+          disabled={empty}
+          accessibilityRole="button"
+          accessibilityLabel="Play playlist"
+          style={({ pressed }) => [
+            styles.plPlayButton,
+            { backgroundColor: accent },
+            empty && styles.plPlayDisabled,
+            pressed && styles.wheelPressed,
+          ]}
+        >
+          <Ionicons name="play" size={28} color={onAccent} style={styles.playGlyphNudge} />
+        </Pressable>
       </View>
     </View>
+  );
+}
+
+/* ------------------------------ Sorting UI -------------------------------- */
+
+function SortRow({ label, onPress }: { label: string; onPress: () => void }) {
+  return (
+    <Pressable
+      onPress={onPress}
+      accessibilityRole="button"
+      accessibilityLabel={`Sort songs. Current order: ${label}`}
+      style={({ pressed }) => [styles.sortRow, pressed && styles.pressed]}
+    >
+      <Ionicons name="swap-vertical" size={16} color={PALETTE.text} />
+      <Text style={styles.sortRowText}>{label}</Text>
+    </Pressable>
+  );
+}
+
+interface SortSheetProps {
+  title: string;
+  options: readonly SortKey[];
+  value: SortKey;
+  onSelect: (key: SortKey) => void;
+  onClose: () => void;
+}
+
+function SortSheet({ title, options, value, onSelect, onClose }: SortSheetProps) {
+  const { accent } = useTheme();
+  return (
+    <SheetFrame onClose={onClose} closeLabel="Close sort options">
+      <Text style={[styles.sheetTitle, styles.sheetTitleSolo]}>{title}</Text>
+      {options.map((key) => {
+        const selected = key === value;
+        return (
+          <Pressable
+            key={key}
+            onPress={() => {
+              onSelect(key);
+              onClose();
+            }}
+            accessibilityRole="button"
+            accessibilityState={{ selected }}
+            style={({ pressed }) => [styles.optionRow, pressed && styles.rowPressed]}
+          >
+            <Text style={[styles.optionLabel, styles.sortOptionText, selected && { color: accent }]}>
+              {SORT_LABELS[key]}
+            </Text>
+            {selected ? <Ionicons name="checkmark" size={22} color={accent} /> : null}
+          </Pressable>
+        );
+      })}
+    </SheetFrame>
+  );
+}
+
+/* ----------------------------- Reorder helpers ---------------------------- */
+
+interface ReorderRowProps {
+  title: string;
+  artist: string;
+  artwork: string | null;
+  canUp: boolean;
+  canDown: boolean;
+  onTop: () => void;
+  onUp: () => void;
+  onDown: () => void;
+  onRemove?: () => void;
+}
+
+function ReorderRow({
+  title,
+  artist,
+  artwork,
+  canUp,
+  canDown,
+  onTop,
+  onUp,
+  onDown,
+  onRemove,
+}: ReorderRowProps) {
+  const dim = '#5A5A5A';
+  return (
+    <View style={styles.reorderRow}>
+      <Artwork uri={artwork} size={40} radius={4} iconSize={18} />
+      <View style={styles.rowText}>
+        <Text numberOfLines={1} style={styles.rowTitle}>
+          {title}
+        </Text>
+        <Text numberOfLines={1} style={[styles.rowSubtitle, styles.rowSubtitleTop]}>
+          {artist}
+        </Text>
+      </View>
+      <IconButton
+        name="arrow-up-circle-outline"
+        size={22}
+        color={canUp ? PALETTE.text : dim}
+        label={`Move ${title} to the top`}
+        onPress={onTop}
+        style={styles.smallIcon}
+      />
+      <IconButton
+        name="chevron-up"
+        size={22}
+        color={canUp ? PALETTE.text : dim}
+        label={`Move ${title} up`}
+        onPress={onUp}
+        style={styles.smallIcon}
+      />
+      <IconButton
+        name="chevron-down"
+        size={22}
+        color={canDown ? PALETTE.text : dim}
+        label={`Move ${title} down`}
+        onPress={onDown}
+        style={styles.smallIcon}
+      />
+      {onRemove ? (
+        <IconButton
+          name="close"
+          size={22}
+          color={PALETTE.textSecondary}
+          label={`Remove ${title}`}
+          onPress={onRemove}
+          style={styles.smallIcon}
+        />
+      ) : null}
+    </View>
+  );
+}
+
+/* --------------------------------- Toast ---------------------------------- */
+
+interface ToastProps {
+  text: string;
+  bottom: number;
+  onDone: () => void;
+}
+
+function Toast({ text, bottom, onDone }: ToastProps) {
+  const opacity = useRef(new Animated.Value(0)).current;
+
+  useEffect(() => {
+    Animated.sequence([
+      Animated.timing(opacity, { toValue: 1, duration: 160, useNativeDriver: true }),
+      Animated.delay(1500),
+      Animated.timing(opacity, { toValue: 0, duration: 220, useNativeDriver: true }),
+    ]).start(({ finished }) => {
+      if (finished) {
+        onDone();
+      }
+    });
+  }, [opacity, onDone]);
+
+  return (
+    <Animated.View pointerEvents="none" style={[styles.toastWrap, { bottom, opacity }]}>
+      <View style={styles.toast}>
+        <Text style={styles.toastText}>{text}</Text>
+      </View>
+    </Animated.View>
+  );
+}
+
+/* -------------------------------- Queue sheet ----------------------------- */
+
+function QueueSheet({ onClose }: { onClose: () => void }) {
+  const { accent } = useTheme();
+  const active = useActiveTrack();
+  const [queue, setQueue] = useState<Track[]>([]);
+  const [activeIndex, setActiveIndex] = useState(-1);
+  const [editing, setEditing] = useState(false);
+
+  const refresh = useCallback(async () => {
+    try {
+      const [items, index] = await Promise.all([
+        TrackPlayer.getQueue(),
+        TrackPlayer.getActiveTrackIndex(),
+      ]);
+      setQueue(items);
+      setActiveIndex(index ?? -1);
+    } catch (error) {
+      console.warn('Could not read the queue', error);
+    }
+  }, []);
+
+  useEffect(() => {
+    void refresh();
+  }, [refresh, active?.id]);
+
+  const run = useCallback(
+    async (action: () => Promise<unknown>) => {
+      try {
+        await action();
+      } catch (error) {
+        console.warn('Queue change failed', error);
+      }
+      await refresh();
+    },
+    [refresh],
+  );
+
+  const base = activeIndex + 1;
+  const upcoming = queue.slice(base);
+  const nowTrack = activeIndex >= 0 ? queue[activeIndex] : undefined;
+
+  const renderItem = ({ item, index }: ListRenderItemInfo<Track>) => {
+    const absolute = base + index;
+    const title = item.title ?? 'Untitled';
+    const artist = item.artist ?? DEFAULT_ARTIST;
+    const artwork = item.artwork ?? null;
+    if (editing) {
+      return (
+        <ReorderRow
+          title={title}
+          artist={artist}
+          artwork={artwork}
+          canUp={index > 0}
+          canDown={index < upcoming.length - 1}
+          onTop={() => void run(() => TrackPlayer.move(absolute, base))}
+          onUp={() => void run(() => TrackPlayer.move(absolute, absolute - 1))}
+          onDown={() => void run(() => TrackPlayer.move(absolute, absolute + 1))}
+          onRemove={() => void run(() => TrackPlayer.remove(absolute))}
+        />
+      );
+    }
+    return (
+      <Pressable
+        onPress={() =>
+          void run(async () => {
+            await TrackPlayer.skip(absolute);
+            await TrackPlayer.play();
+          })
+        }
+        accessibilityRole="button"
+        accessibilityLabel={`Play ${title} by ${artist}`}
+        style={({ pressed }) => [styles.selectRow, pressed && styles.rowPressed]}
+      >
+        <Artwork uri={artwork} size={40} radius={4} iconSize={18} />
+        <View style={styles.rowText}>
+          <Text numberOfLines={1} style={styles.rowTitle}>
+            {title}
+          </Text>
+          <Text numberOfLines={1} style={[styles.rowSubtitle, styles.rowSubtitleTop]}>
+            {artist}
+          </Text>
+        </View>
+      </Pressable>
+    );
+  };
+
+  return (
+    <SheetFrame onClose={onClose} closeLabel="Close queue">
+      <View style={styles.queueHeadRow}>
+        <Text style={styles.sheetTitle}>Queue</Text>
+        {upcoming.length > 1 || editing ? (
+          <Pill
+            icon={editing ? 'checkmark' : 'create-outline'}
+            label={editing ? 'Done' : 'Edit'}
+            active={editing}
+            onPress={() => setEditing((previous) => !previous)}
+          />
+        ) : null}
+      </View>
+      {nowTrack ? (
+        <View style={styles.queueNow}>
+          <Text style={styles.queueLabel}>NOW PLAYING</Text>
+          <View style={styles.queueNowRow}>
+            <Artwork uri={nowTrack.artwork ?? null} size={40} radius={4} iconSize={18} />
+            <View style={styles.rowText}>
+              <Text numberOfLines={1} style={[styles.rowTitle, { color: accent }]}>
+                {nowTrack.title ?? 'Untitled'}
+              </Text>
+              <Text numberOfLines={1} style={[styles.rowSubtitle, styles.rowSubtitleTop]}>
+                {nowTrack.artist ?? DEFAULT_ARTIST}
+              </Text>
+            </View>
+          </View>
+        </View>
+      ) : null}
+      <Text style={[styles.queueLabel, styles.queueNextLabel]}>
+        {`NEXT UP • ${upcoming.length}`}
+      </Text>
+      {upcoming.length === 0 ? (
+        <Text style={styles.sheetHint}>
+          Nothing is queued next. Use Play next or Add to queue from any song menu.
+        </Text>
+      ) : (
+        <FlatList
+          data={upcoming}
+          keyExtractor={(item, index) => `${base + index}-${String(item.id)}`}
+          renderItem={renderItem}
+          extraData={editing}
+          style={styles.sheetListTall}
+          keyboardShouldPersistTaps="handled"
+        />
+      )}
+      <View style={styles.sheetActions}>
+        <Pressable
+          onPress={() =>
+            void run(async () => {
+              if (upcoming.length < 2) {
+                return;
+              }
+              await TrackPlayer.removeUpcomingTracks();
+              await TrackPlayer.add(shuffled(upcoming));
+            })
+          }
+          accessibilityRole="button"
+          style={({ pressed }) => [styles.secondaryButton, pressed && styles.pressed]}
+        >
+          <Text style={styles.secondaryButtonText}>Shuffle next</Text>
+        </Pressable>
+        <Pressable
+          onPress={() => void run(() => TrackPlayer.removeUpcomingTracks())}
+          accessibilityRole="button"
+          style={({ pressed }) => [styles.secondaryButton, pressed && styles.pressed]}
+        >
+          <Text style={styles.secondaryButtonText}>Clear</Text>
+        </Pressable>
+      </View>
+    </SheetFrame>
   );
 }
 
@@ -1640,6 +2231,7 @@ interface OptionsOverlayProps {
   onTogglePlaylist: (playlistId: string, trackId: string) => void;
   onCreatePlaylist: (name: string, trackId: string) => void;
   onRemoveFromPlaylist: (trackId: string) => void;
+  onQueue: (trackId: string, playNext: boolean) => void;
 }
 
 function TrackOptionsOverlay(props: OptionsOverlayProps) {
@@ -1665,6 +2257,7 @@ function OptionsSheet({
   onTogglePlaylist,
   onCreatePlaylist,
   onRemoveFromPlaylist,
+  onQueue,
 }: OptionsSheetProps) {
   const { accent, onAccent } = useTheme();
   const [mode, setMode] = useState<OptionsMode>('menu');
@@ -1680,11 +2273,21 @@ function OptionsSheet({
     switch (mode) {
       case 'menu':
         return (
-          <View>
+          <ScrollView style={styles.menuScroll}>
             <OptionRow
               icon={track.liked ? 'heart-dislike-outline' : 'heart-outline'}
               label={track.liked ? 'Remove from Liked Songs' : 'Add to Liked Songs'}
               onPress={runAndClose(() => onToggleLike(track.id))}
+            />
+            <OptionRow
+              icon="play-forward-outline"
+              label="Play next"
+              onPress={runAndClose(() => onQueue(track.id, true))}
+            />
+            <OptionRow
+              icon="list-outline"
+              label="Add to queue"
+              onPress={runAndClose(() => onQueue(track.id, false))}
             />
             <OptionRow
               icon="add-circle-outline"
@@ -1713,7 +2316,7 @@ function OptionsSheet({
               label="Remove from library"
               onPress={runAndClose(() => onRemove(track.id))}
             />
-          </View>
+          </ScrollView>
         );
       case 'edit':
         return (
@@ -1865,6 +2468,7 @@ interface NowPlayingProps {
   onToggleShuffle: () => void;
   onCycleRepeat: () => void;
   onMore: (id: string) => void;
+  onOpenQueue: () => void;
 }
 
 function NowPlayingSheet(props: NowPlayingProps) {
@@ -1896,6 +2500,7 @@ function NowPlayingContent({
   onToggleShuffle,
   onCycleRepeat,
   onMore,
+  onOpenQueue,
 }: NowPlayingContentProps) {
   const { accent, onAccent } = useTheme();
   const insets = useSafeAreaInsets();
@@ -2020,7 +2625,7 @@ function NowPlayingContent({
             </View>
           </View>
 
-          <View style={[styles.npControls, { paddingBottom: insets.bottom + 20 }]}>
+          <View style={styles.npControls}>
             <View style={styles.controlSlot}>
               <IconButton
                 name="shuffle"
@@ -2076,6 +2681,15 @@ function NowPlayingContent({
               {repeatActive ? <View style={[styles.activeDot, { backgroundColor: accent }]} /> : null}
             </View>
           </View>
+          <View style={[styles.npFooter, { paddingBottom: insets.bottom + 12 }]}>
+            <IconButton
+              name="list"
+              size={24}
+              color={PALETTE.textSecondary}
+              label="Open queue"
+              onPress={onOpenQueue}
+            />
+          </View>
           {optionsOverlay}
         </View>
       </View>
@@ -2107,6 +2721,11 @@ function AppShell() {
   const [playlists, setPlaylists] = useState<Playlist[]>([]);
   const [openPlaylistId, setOpenPlaylistId] = useState<string | null>(null);
   const [playlistSheet, setPlaylistSheet] = useState<PlaylistSheetState | null>(null);
+  const [librarySort, setLibrarySort] = useState<SortKey>('added');
+  const [sortSheet, setSortSheet] = useState<'library' | 'playlist' | null>(null);
+  const [reordering, setReordering] = useState(false);
+  const [queueOpen, setQueueOpen] = useState(false);
+  const [toast, setToast] = useState<{ id: number; text: string } | null>(null);
 
   const tracksRef = useRef<LibraryTrack[]>([]);
   const playlistsRef = useRef<Playlist[]>([]);
@@ -2151,13 +2770,16 @@ function AppShell() {
           setPlayerError(errorMessage(error));
         }
       }
+      await ensureDirectories();
       const loaded = await loadLibrary();
       const loadedPlaylists = await loadPlaylists(new Set(loaded.map((track) => track.id)));
+      const loadedSort = await loadLibrarySort();
       if (!cancelled) {
         tracksRef.current = loaded;
         playlistsRef.current = loadedPlaylists;
         setTracks(loaded);
         setPlaylists(loadedPlaylists);
+        setLibrarySort(loadedSort);
         setHydrated(true);
       }
     })();
@@ -2187,6 +2809,8 @@ function AppShell() {
         id: nextPlaylistId(),
         name: trimmed || `Playlist ${playlistsRef.current.length + 1}`,
         trackIds: firstTrackId ? [firstTrackId] : [],
+        cover: null,
+        sort: 'custom',
       };
       commitPlaylists((previous) => [...previous, playlist]);
       return playlist.id;
@@ -2209,11 +2833,102 @@ function AppShell() {
 
   const deletePlaylist = useCallback(
     (id: string) => {
+      const target = playlistsRef.current.find((playlist) => playlist.id === id);
       commitPlaylists((previous) => previous.filter((playlist) => playlist.id !== id));
       setOpenPlaylistId((previous) => (previous === id ? null : previous));
+      if (target?.cover) {
+        void removeFile(target.cover);
+      }
     },
     [commitPlaylists],
   );
+
+  const setPlaylistCover = useCallback(
+    async (id: string) => {
+      try {
+        const result = await DocumentPicker.getDocumentAsync({
+          type: 'image/*',
+          multiple: false,
+          copyToCacheDirectory: true,
+        });
+        if (result.canceled) {
+          return;
+        }
+        const asset = result.assets[0];
+        const existing = playlistsRef.current.find((playlist) => playlist.id === id);
+        if (!existing) {
+          await removeFile(asset.uri);
+          return;
+        }
+        await ensureDirectories();
+        const extension = fileExtension(asset.name, asset.mimeType, IMAGE_MIME_EXTENSIONS, 'jpg');
+        const destination = `${ART_DIR}${id}-cover-${Date.now()}.${extension}`;
+        await FileSystem.copyAsync({ from: asset.uri, to: destination });
+        await removeFile(asset.uri);
+        await removeFile(existing.cover);
+        commitPlaylists((previous) =>
+          previous.map((playlist) => (playlist.id === id ? { ...playlist, cover: destination } : playlist)),
+        );
+      } catch (error) {
+        Alert.alert('Cover failed', errorMessage(error));
+      }
+    },
+    [commitPlaylists],
+  );
+
+  const clearPlaylistCover = useCallback(
+    (id: string) => {
+      const existing = playlistsRef.current.find((playlist) => playlist.id === id);
+      if (!existing?.cover) {
+        return;
+      }
+      void removeFile(existing.cover);
+      commitPlaylists((previous) =>
+        previous.map((playlist) => (playlist.id === id ? { ...playlist, cover: null } : playlist)),
+      );
+    },
+    [commitPlaylists],
+  );
+
+  const setPlaylistSort = useCallback(
+    (id: string, sort: SortKey) => {
+      commitPlaylists((previous) =>
+        previous.map((playlist) => (playlist.id === id ? { ...playlist, sort } : playlist)),
+      );
+    },
+    [commitPlaylists],
+  );
+
+  const moveTrackInPlaylist = useCallback(
+    (playlistId: string, trackId: string, direction: 'top' | 'up' | 'down') => {
+      commitPlaylists((previous) =>
+        previous.map((playlist) => {
+          if (playlist.id !== playlistId) {
+            return playlist;
+          }
+          const ids = [...playlist.trackIds];
+          const from = ids.indexOf(trackId);
+          if (from < 0) {
+            return playlist;
+          }
+          const to =
+            direction === 'top' ? 0 : direction === 'up' ? from - 1 : from + 1;
+          if (to < 0 || to >= ids.length || to === from) {
+            return playlist;
+          }
+          ids.splice(from, 1);
+          ids.splice(to, 0, trackId);
+          return { ...playlist, trackIds: ids };
+        }),
+      );
+    },
+    [commitPlaylists],
+  );
+
+  const showToast = useCallback((text: string) => {
+    setToast((previous) => ({ id: (previous?.id ?? 0) + 1, text }));
+  }, []);
+  const clearToast = useCallback(() => setToast(null), []);
 
   const togglePlaylistTrack = useCallback(
     (playlistId: string, trackId: string) => {
@@ -2259,24 +2974,28 @@ function AppShell() {
   const visibleTracks = useMemo(() => {
     if (openPlaylist) {
       const byId = new Map(tracks.map((track) => [track.id, track] as const));
-      return openPlaylist.trackIds
+      const members = openPlaylist.trackIds
         .map((id) => byId.get(id))
         .filter((track): track is LibraryTrack => track !== undefined);
+      return sortTracks(members, openPlaylist.sort);
     }
-    return likedOnly ? tracks.filter((track) => track.liked) : tracks;
-  }, [tracks, likedOnly, openPlaylist]);
+    const base = likedOnly ? tracks.filter((track) => track.liked) : tracks;
+    return sortTracks(base, librarySort);
+  }, [tracks, likedOnly, openPlaylist, librarySort]);
   visibleRef.current = visibleTracks;
 
   const playlistArtwork = useMemo(() => {
     const artworkById = new Map(tracks.map((track) => [track.id, track.artwork] as const));
     const result = new Map<string, string | null>();
     for (const playlist of playlists) {
-      let found: string | null = null;
-      for (const id of playlist.trackIds) {
-        const art = artworkById.get(id);
-        if (art) {
-          found = art;
-          break;
+      let found: string | null = playlist.cover;
+      if (!found) {
+        for (const id of playlist.trackIds) {
+          const art = artworkById.get(id);
+          if (art) {
+            found = art;
+            break;
+          }
         }
       }
       result.set(playlist.id, found);
@@ -2306,10 +3025,22 @@ function AppShell() {
         return [];
       }
       setImporting(true);
-      const added: LibraryTrack[] = [];
       const skipped: string[] = [];
       try {
-        for (const file of files) {
+        await ensureDirectories();
+        const isImage = (file: IncomingFile) =>
+          isImageName(file.name) || (file.mimeType?.startsWith('image/') ?? false);
+        const images = files.filter(isImage);
+        const audio = files.filter((file) => !isImage(file));
+        const imageByKey = new Map<string, IncomingFile>();
+        for (const image of images) {
+          imageByKey.set(baseKey(image.name), image);
+        }
+        const usedImages = new Set<IncomingFile>();
+        const artById = new Map<string, string>();
+        const added: LibraryTrack[] = [];
+
+        for (const file of audio) {
           try {
             if (!(await fileExists(file.uri))) {
               continue;
@@ -2321,32 +3052,80 @@ function AppShell() {
               AUDIO_MIME_EXTENSIONS,
               'mp3',
             );
-            const destination = `${DOC_DIR}${id}.${extension}`;
-            if (file.mode === 'move') {
-              await FileSystem.moveAsync({ from: file.uri, to: destination });
-            } else {
+            const destination = `${SONGS_DIR}${id}${slugSuffix(file.name)}.${extension}`;
+            await transferFile(file, destination);
+            const names = parseTrackNames(file.name);
+            let artwork: string | null = null;
+            const match =
+              imageByKey.get(baseKey(file.name)) ??
+              imageByKey.get(baseKey(`${names.artist} - ${names.title}`)) ??
+              imageByKey.get(baseKey(names.title));
+            if (match && !usedImages.has(match)) {
+              usedImages.add(match);
               try {
-                await FileSystem.copyAsync({ from: file.uri, to: destination });
-              } finally {
-                await removeFile(file.uri);
+                artwork = await importArtwork(match, id);
+              } catch {
+                skipped.push(match.name);
               }
             }
-            const names = parseTrackNames(file.name);
             added.push({
               id,
               title: names.title,
               artist: names.artist,
               uri: destination,
-              artwork: null,
+              artwork,
               liked: false,
+              sourceName: stripExtension(file.name),
             });
           } catch {
             skipped.push(file.name);
           }
         }
+
+        const owners = [...tracksRef.current, ...added];
+        for (const image of images) {
+          if (usedImages.has(image)) {
+            continue;
+          }
+          const key = baseKey(image.name);
+          const owner = owners.find((track) => trackKeys(track).includes(key));
+          if (!owner) {
+            if (image.mode === 'copy') {
+              await removeFile(image.uri);
+              skipped.push(`${image.name} (no song with this name)`);
+            }
+            continue;
+          }
+          try {
+            const uri = await importArtwork(image, owner.id);
+            if (uri) {
+              const previous = artById.get(owner.id) ?? owner.artwork;
+              artById.set(owner.id, uri);
+              if (previous) {
+                await removeFile(previous);
+              }
+            }
+          } catch {
+            skipped.push(image.name);
+          }
+        }
+
+        const withArt = (track: LibraryTrack): LibraryTrack =>
+          artById.has(track.id) ? { ...track, artwork: artById.get(track.id) ?? null } : track;
+        if (added.length > 0 || artById.size > 0) {
+          commitTracks((previous) => [...previous.map(withArt), ...added.map(withArt)]);
+        }
+        const addedIds = new Set(added.map((track) => track.id));
+        for (const id of artById.keys()) {
+          if (!addedIds.has(id)) {
+            const updated = tracksRef.current.find((track) => track.id === id);
+            if (updated) {
+              await syncQueueMetadata(updated);
+            }
+          }
+        }
         if (added.length > 0) {
-          commitTracks((previous) => [...previous, ...added]);
-          await appendToQueue(added);
+          await appendToQueue(added.map(withArt));
         }
       } finally {
         setImporting(false);
@@ -2372,7 +3151,7 @@ function AppShell() {
     importingRef.current = true;
     try {
       const result = await DocumentPicker.getDocumentAsync({
-        type: 'audio/*',
+        type: ['audio/*', 'image/*'],
         multiple: true,
         copyToCacheDirectory: true,
       });
@@ -2398,7 +3177,7 @@ function AppShell() {
   const scanForNewFiles = useCallback(async () => {
     try {
       const skipped = await enqueue(async () =>
-        processFiles(await findDroppedAudio(tracksRef.current)),
+        processFiles(await findDroppedFiles(tracksRef.current, playlistsRef.current)),
       );
       reportSkipped(skipped);
     } catch (error) {
@@ -2406,24 +3185,52 @@ function AppShell() {
     }
   }, [enqueue, processFiles]);
 
+  const importFromUrl = useCallback(
+    async (url: string) => {
+      try {
+        if (!url.startsWith('file://')) {
+          await scanForNewFiles();
+          return;
+        }
+        const decoded = decodeURIComponent(url.split('?')[0]);
+        const name = decoded.split('/').pop() ?? '';
+        const container = /\/Application\/([^/]+)\//.exec(DOC_DIR)?.[1];
+        const ownFile = container !== undefined && decoded.includes(container);
+        if (ownFile || !(isAudioName(name) || isImageName(name))) {
+          await scanForNewFiles();
+          return;
+        }
+        reportSkipped(await enqueue(() => processFiles([{ uri: url, name, mode: 'keep' }])));
+      } catch (error) {
+        console.warn('Could not open the shared file', error);
+      }
+    },
+    [enqueue, processFiles, scanForNewFiles],
+  );
+
   useEffect(() => {
     if (!hydrated) {
       return undefined;
     }
     void scanForNewFiles();
+    void Linking.getInitialURL().then((url) => {
+      if (url) {
+        void importFromUrl(url);
+      }
+    });
     const stateSubscription = AppState.addEventListener('change', (state) => {
       if (state === 'active') {
         void scanForNewFiles();
       }
     });
-    const linkSubscription = Linking.addEventListener('url', () => {
-      void scanForNewFiles();
+    const linkSubscription = Linking.addEventListener('url', ({ url }) => {
+      void importFromUrl(url);
     });
     return () => {
       stateSubscription.remove();
       linkSubscription.remove();
     };
-  }, [hydrated, scanForNewFiles]);
+  }, [hydrated, scanForNewFiles, importFromUrl]);
 
   const orderingSource = useCallback((): LibraryTrack[] => {
     const byId = new Map(tracksRef.current.map((track) => [track.id, track] as const));
@@ -2539,7 +3346,8 @@ function AppShell() {
           return;
         }
         const extension = fileExtension(asset.name, asset.mimeType, IMAGE_MIME_EXTENSIONS, 'jpg');
-        const destination = `${DOC_DIR}${id}-art-${Date.now()}.${extension}`;
+        await ensureDirectories();
+        const destination = `${ART_DIR}${id}-art-${Date.now()}.${extension}`;
         await FileSystem.copyAsync({ from: asset.uri, to: destination });
         await removeFile(asset.uri);
         await removeFile(existing.artwork);
@@ -2678,14 +3486,21 @@ function AppShell() {
       if (!target) {
         return;
       }
-      Alert.alert(target.name, undefined, [
+      const buttons: AlertButton[] = [
         { text: 'Add songs', onPress: () => setPlaylistSheet({ kind: 'addSongs', id }) },
         { text: 'Rename', onPress: () => setPlaylistSheet({ kind: 'rename', id }) },
+        { text: 'Change cover', onPress: () => void setPlaylistCover(id) },
+      ];
+      if (target.cover) {
+        buttons.push({ text: 'Remove cover', onPress: () => clearPlaylistCover(id) });
+      }
+      buttons.push(
         { text: 'Delete playlist', style: 'destructive', onPress: () => confirmDeletePlaylist(id) },
         { text: 'Cancel', style: 'cancel' },
-      ]);
+      );
+      Alert.alert(target.name, undefined, buttons);
     },
-    [confirmDeletePlaylist],
+    [confirmDeletePlaylist, setPlaylistCover, clearPlaylistCover],
   );
 
   const removeFromOpenPlaylist = useCallback(
@@ -2707,26 +3522,97 @@ function AppShell() {
   const openOptions = useCallback((id: string) => setOptionsId(id), []);
   const closeOptions = useCallback(() => setOptionsId(null), []);
   const openNowPlaying = useCallback(() => setNowPlayingOpen(true), []);
-  const closeNowPlaying = useCallback(() => setNowPlayingOpen(false), []);
+  const closeNowPlaying = useCallback(() => {
+    setNowPlayingOpen(false);
+    setQueueOpen(false);
+  }, []);
+  const openQueue = useCallback(() => setQueueOpen(true), []);
+  const closeQueue = useCallback(() => setQueueOpen(false), []);
+  const closeSortSheet = useCallback(() => setSortSheet(null), []);
+
+  useEffect(() => {
+    setReordering(false);
+  }, [openPlaylistId]);
+
+  const toggleReorder = useCallback(() => {
+    if (openPlaylistId === null) {
+      return;
+    }
+    if (!reordering) {
+      setPlaylistSort(openPlaylistId, 'custom');
+    }
+    setReordering(!reordering);
+  }, [openPlaylistId, reordering, setPlaylistSort]);
+
+  const selectLibrarySort = useCallback((key: SortKey) => {
+    setLibrarySort(key);
+    void persistJson(LIBRARY_SETTINGS_URI, { sort: key });
+  }, []);
+
+  const queueTrack = useCallback(
+    async (trackId: string, playNext: boolean) => {
+      const target = tracksRef.current.find((track) => track.id === trackId);
+      if (!target) {
+        return;
+      }
+      try {
+        showToast(await enqueueTrack(target, playNext));
+      } catch (error) {
+        Alert.alert('Queue failed', errorMessage(error));
+      }
+    },
+    [showToast],
+  );
   const toggleTray = useCallback(() => setTrayOpen((previous) => !previous), []);
 
   const inPlaylistsTab = filter === 'playlists' && openPlaylist === null;
   const showGrid = filter === null && openPlaylist === null;
   const showDownloaded = filter === 'downloaded';
 
+  const reorderActive = reordering && openPlaylist !== null;
+
   const renderItem = useCallback(
-    ({ item }: ListRenderItemInfo<LibraryTrack>) => (
-      <TrackRow
-        track={item}
-        active={item.id === activeTrack?.id}
-        playing={playing === true}
-        accent={accent}
-        showDownloaded={showDownloaded}
-        onPress={playTrack}
-        onMore={openOptions}
-      />
-    ),
-    [activeTrack?.id, playing, accent, showDownloaded, playTrack, openOptions],
+    ({ item, index }: ListRenderItemInfo<LibraryTrack>) => {
+      if (reorderActive && openPlaylistId !== null) {
+        const last = visibleRef.current.length - 1;
+        return (
+          <ReorderRow
+            title={item.title}
+            artist={item.artist}
+            artwork={item.artwork}
+            canUp={index > 0}
+            canDown={index < last}
+            onTop={() => moveTrackInPlaylist(openPlaylistId, item.id, 'top')}
+            onUp={() => moveTrackInPlaylist(openPlaylistId, item.id, 'up')}
+            onDown={() => moveTrackInPlaylist(openPlaylistId, item.id, 'down')}
+            onRemove={() => removeFromOpenPlaylist(item.id)}
+          />
+        );
+      }
+      return (
+        <TrackRow
+          track={item}
+          active={item.id === activeTrack?.id}
+          playing={playing === true}
+          accent={accent}
+          showDownloaded={showDownloaded}
+          onPress={playTrack}
+          onMore={openOptions}
+        />
+      );
+    },
+    [
+      reorderActive,
+      openPlaylistId,
+      moveTrackInPlaylist,
+      removeFromOpenPlaylist,
+      activeTrack?.id,
+      playing,
+      accent,
+      showDownloaded,
+      playTrack,
+      openOptions,
+    ],
   );
 
   const keyExtractor = useCallback((item: LibraryTrack) => item.id, []);
@@ -2794,12 +3680,20 @@ function AppShell() {
         <PlaylistHeader
           playlist={openPlaylist}
           trackCount={visibleTracks.length}
+          cover={playlistArtwork.get(openPlaylist.id) ?? null}
+          sortLabel={SORT_LABELS[openPlaylist.sort]}
+          reordering={reordering}
           onBack={closePlaylist}
           onPlay={() => void playContext(false)}
           onShuffle={() => void playContext(true)}
           onAddSongs={() => setPlaylistSheet({ kind: 'addSongs', id: openPlaylist.id })}
+          onSort={() => setSortSheet('playlist')}
+          onReorder={toggleReorder}
           onMore={() => openPlaylistMenu(openPlaylist.id)}
         />
+      ) : null}
+      {openPlaylist === null && tracks.length > 1 ? (
+        <SortRow label={SORT_LABELS[librarySort]} onPress={() => setSortSheet('library')} />
       ) : null}
       {showGrid ? (
         <LibraryGrid
@@ -2887,6 +3781,7 @@ function AppShell() {
       onTogglePlaylist={togglePlaylistTrack}
       onCreatePlaylist={createPlaylist}
       onRemoveFromPlaylist={removeFromOpenPlaylist}
+      onQueue={(id, next) => void queueTrack(id, next)}
     />
   );
 
@@ -2946,9 +3841,47 @@ function AppShell() {
         onToggleShuffle={toggleShuffle}
         onCycleRepeat={() => void cycleRepeat()}
         onMore={openOptions}
-        optionsOverlay={renderOptions(nowPlayingOpen && optionsId !== null, false)}
+        onOpenQueue={openQueue}
+        optionsOverlay={
+          <>
+            {renderOptions(nowPlayingOpen && optionsId !== null, false)}
+            {nowPlayingOpen && queueOpen ? <QueueSheet onClose={closeQueue} /> : null}
+            {nowPlayingOpen && toast ? (
+              <Toast key={toast.id} text={toast.text} bottom={insets.bottom + 96} onDone={clearToast} />
+            ) : null}
+          </>
+        }
       />
       {renderOptions(!nowPlayingOpen && optionsId !== null, true)}
+      {sortSheet === 'library' ? (
+        <SortSheet
+          title="Sort songs by"
+          options={LIBRARY_SORTS}
+          value={librarySort}
+          onSelect={selectLibrarySort}
+          onClose={closeSortSheet}
+        />
+      ) : null}
+      {sortSheet === 'playlist' && openPlaylist ? (
+        <SortSheet
+          title="Sort playlist by"
+          options={PLAYLIST_SORTS}
+          value={openPlaylist.sort}
+          onSelect={(key) => setPlaylistSort(openPlaylist.id, key)}
+          onClose={closeSortSheet}
+        />
+      ) : null}
+      {!nowPlayingOpen && toast ? (
+        <Toast
+          key={toast.id}
+          text={toast.text}
+          bottom={
+            insets.bottom +
+            (currentTrack ? MINI_PLAYER_BOTTOM_OFFSET + MINI_PLAYER_HEIGHT + 12 : 24)
+          }
+          onDone={clearToast}
+        />
+      ) : null}
       <PlaylistSheetHost
         state={playlistSheet}
         tracks={tracks}
@@ -3270,10 +4203,56 @@ const styles = StyleSheet.create({
     elevation: 10,
   },
   playGlyphNudge: { marginLeft: 4 },
+  npFooter: { flexDirection: 'row', justifyContent: 'flex-end', paddingHorizontal: 20, paddingTop: 8 },
+
+  sortRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    paddingHorizontal: 16,
+    paddingVertical: 10,
+    alignSelf: 'flex-start',
+  },
+  sortRowText: { color: PALETTE.text, fontSize: 14, fontWeight: '700' },
+  sortOptionText: { flex: 1 },
+  reorderRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    paddingLeft: 16,
+    paddingRight: 8,
+    paddingVertical: 6,
+  },
+  smallIcon: { width: 34, height: 34 },
+  toastWrap: { position: 'absolute', left: 0, right: 0, alignItems: 'center' },
+  toast: {
+    backgroundColor: '#2A2A2A',
+    paddingHorizontal: 18,
+    paddingVertical: 10,
+    borderRadius: 8,
+  },
+  toastText: { color: PALETTE.text, fontSize: 14, fontWeight: '700' },
+  queueHeadRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingHorizontal: 16,
+    paddingBottom: 8,
+  },
+  queueNow: { paddingHorizontal: 16, paddingBottom: 8 },
+  queueNowRow: { flexDirection: 'row', alignItems: 'center', gap: 12, marginTop: 8 },
+  queueLabel: {
+    color: PALETTE.textSecondary,
+    fontSize: 12,
+    fontWeight: '800',
+    letterSpacing: 1,
+  },
+  queueNextLabel: { paddingHorizontal: 16, paddingTop: 8, paddingBottom: 4 },
 
   rowSubtitleTop: { marginTop: 2 },
   sheetTitle: { color: PALETTE.text, fontSize: 18, fontWeight: '800' },
-  sheetTitleSolo: { paddingHorizontal: 16 },
+  sheetTitleSolo: { paddingHorizontal: 16, paddingBottom: 4 },
+  menuScroll: { maxHeight: 460 },
   sheetHeader: { paddingHorizontal: 16, paddingBottom: 12, gap: 2 },
   sheetHint: {
     color: PALETTE.textSecondary,
@@ -3317,12 +4296,15 @@ const styles = StyleSheet.create({
   },
   plTitle: { color: PALETTE.text, fontSize: 28, fontWeight: '800', letterSpacing: -0.5, marginTop: 4 },
   plMeta: { color: PALETTE.textSecondary, fontSize: 14, marginTop: 4 },
-  plActions: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    marginTop: 16,
+  plCoverWrap: { alignItems: 'center', paddingTop: 8, paddingBottom: 12 },
+  plCoverShadow: {
+    shadowColor: '#000000',
+    shadowOpacity: 0.5,
+    shadowRadius: 20,
+    shadowOffset: { width: 0, height: 10 },
+    elevation: 12,
   },
+  plPills: { flexDirection: 'row', flexWrap: 'wrap', gap: 8, marginTop: 14 },
   plAddButton: {
     height: 36,
     paddingHorizontal: 14,
@@ -3334,7 +4316,13 @@ const styles = StyleSheet.create({
     gap: 6,
   },
   plAddText: { color: PALETTE.text, fontSize: 14, fontWeight: '700' },
-  plPlayGroup: { flexDirection: 'row', alignItems: 'center', gap: 8 },
+  plPlayGroup: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'flex-end',
+    gap: 8,
+    marginTop: 4,
+  },
   plPlayButton: {
     width: 56,
     height: 56,
