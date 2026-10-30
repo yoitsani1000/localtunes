@@ -1,19 +1,37 @@
 {
   "expo": {
-    "name": "localtunes",
+    "name": "Decibel",
     "slug": "localtunes",
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
-    "userInterfaceStyle": "light",
+    "userInterfaceStyle": "dark",
     "ios": {
       "supportsTablet": true,
       "bundleIdentifier": "com.anuragmallick.localtunes",
-      "infoPlist": { "UIBackgroundModes": ["audio"] }
+      "infoPlist": {
+        "UIBackgroundModes": ["audio"],
+        "UIFileSharingEnabled": true,
+        "CFBundleDocumentTypes": [
+          {
+            "CFBundleTypeName": "Audio",
+            "CFBundleTypeRole": "Viewer",
+            "LSHandlerRank": "Alternate",
+            "LSItemContentTypes": [
+              "public.audio",
+              "public.mp3",
+              "public.mpeg-4-audio",
+              "com.apple.m4a-audio",
+              "com.microsoft.waveform-audio",
+              "public.aiff-audio"
+            ]
+          }
+        ]
+      }
     },
     "android": {
       "adaptiveIcon": {
-        "backgroundColor": "#E6F4FE",
+        "backgroundColor": "#000000",
         "foregroundImage": "./assets/android-icon-foreground.png",
         "backgroundImage": "./assets/android-icon-background.png",
         "monochromeImage": "./assets/android-icon-monochrome.png"
@@ -22,6 +40,33 @@
     },
     "web": {
       "favicon": "./assets/favicon.png"
-    }
+    },
+    "plugins": [
+      [
+        "expo-alternate-app-icons",
+        [
+          {
+            "name": "Blue",
+            "ios": "./assets/icons/blue.png",
+            "android": { "foregroundImage": "./assets/icons/blue-foreground.png", "backgroundColor": "#000000" }
+          },
+          {
+            "name": "Purple",
+            "ios": "./assets/icons/purple.png",
+            "android": { "foregroundImage": "./assets/icons/purple-foreground.png", "backgroundColor": "#000000" }
+          },
+          {
+            "name": "Pink",
+            "ios": "./assets/icons/pink.png",
+            "android": { "foregroundImage": "./assets/icons/pink-foreground.png", "backgroundColor": "#000000" }
+          },
+          {
+            "name": "Orange",
+            "ios": "./assets/icons/orange.png",
+            "android": { "foregroundImage": "./assets/icons/orange-foreground.png", "backgroundColor": "#000000" }
+          }
+        ]
+      ]
+    ]
   }
 }

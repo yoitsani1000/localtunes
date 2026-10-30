@@ -13,9 +13,11 @@ import {
   ActivityIndicator,
   Alert,
   Animated,
+  AppState,
   FlatList,
   Image,
   KeyboardAvoidingView,
+  Linking,
   Modal,
   PanResponder,
   Platform,
@@ -34,6 +36,11 @@ import { LinearGradient } from 'expo-linear-gradient';
 import { Ionicons } from '@expo/vector-icons';
 import Slider from '@react-native-community/slider';
 import * as DocumentPicker from 'expo-document-picker';
+import {
+  getAppIconName,
+  setAlternateAppIcon,
+  supportsAlternateIcons,
+} from 'expo-alternate-app-icons';
 import * as FileSystem from 'expo-file-system/legacy';
 import TrackPlayer, {
   AppKilledPlaybackBehavior,
@@ -71,6 +78,14 @@ interface AccentOption {
   key: string;
   label: string;
   color: string;
+  icon: string | null;
+}
+
+interface IncomingFile {
+  uri: string;
+  name: string;
+  mimeType?: string;
+  mode: 'copy' | 'move';
 }
 
 const PALETTE = {
@@ -82,12 +97,14 @@ const PALETTE = {
 } as const;
 
 const ACCENTS: readonly AccentOption[] = [
-  { key: 'green', label: 'Green', color: '#1DB954' },
-  { key: 'blue', label: 'Blue', color: '#2E8BFF' },
-  { key: 'purple', label: 'Purple', color: '#8352F5' },
-  { key: 'pink', label: 'Pink', color: '#FF2E93' },
-  { key: 'orange', label: 'Orange', color: '#FF7A1A' },
+  { key: 'green', label: 'Green', color: '#1DB954', icon: null },
+  { key: 'blue', label: 'Blue', color: '#2E8BFF', icon: 'Blue' },
+  { key: 'purple', label: 'Purple', color: '#8352F5', icon: 'Purple' },
+  { key: 'pink', label: 'Pink', color: '#FF2E93', icon: 'Pink' },
+  { key: 'orange', label: 'Orange', color: '#FF7A1A', icon: 'Orange' },
 ];
+
+const ICON_SWITCH_DELAY_MS = 900;
 
 const FILTERS: readonly { key: FilterKey; label: string }[] = [
   { key: 'playlists', label: 'Playlists' },
@@ -98,6 +115,17 @@ const FILTERS: readonly { key: FilterKey; label: string }[] = [
 const DOC_DIR = FileSystem.documentDirectory ?? '';
 const METADATA_URI = `${DOC_DIR}tracks_metadata.json`;
 const SKIN_URI = `${DOC_DIR}skin_settings.json`;
+const INBOX_URI = `${DOC_DIR}Inbox/`;
+const AUDIO_EXTENSIONS: ReadonlySet<string> = new Set([
+  'mp3',
+  'm4a',
+  'aac',
+  'wav',
+  'flac',
+  'aiff',
+  'aif',
+  'caf',
+]);
 const DEFAULT_ARTIST = 'Unknown Artist';
 
 const MINI_PLAYER_HEIGHT = 64;
@@ -211,6 +239,24 @@ function fileExtension(
     return mimeMap[mimeType];
   }
   return fallback;
+}
+
+function isAudioName(name: string): boolean {
+  const match = /\.([A-Za-z0-9]{1,5})$/.exec(name);
+  return match !== null && AUDIO_EXTENSIONS.has(match[1].toLowerCase());
+}
+
+let trackCounter = 0;
+
+function nextTrackId(): string {
+  trackCounter += 1;
+  return `${Date.now()}-${trackCounter}`;
+}
+
+function reportSkipped(skipped: string[]): void {
+  if (skipped.length > 0) {
+    Alert.alert('Some files were skipped', skipped.join('\n'));
+  }
 }
 
 function parseTrackNames(fileName: string): { title: string; artist: string } {
@@ -346,6 +392,26 @@ async function loadLibrary(): Promise<LibraryTrack[]> {
     console.warn('Could not read the library file', error);
     return [];
   }
+}
+
+async function findDroppedAudio(library: LibraryTrack[]): Promise<IncomingFile[]> {
+  const known = new Set(library.map((track) => track.uri));
+  const found: IncomingFile[] = [];
+  for (const directory of [DOC_DIR, INBOX_URI]) {
+    let names: string[];
+    try {
+      names = await FileSystem.readDirectoryAsync(directory);
+    } catch {
+      continue;
+    }
+    for (const name of names) {
+      const uri = `${directory}${name}`;
+      if (isAudioName(name) && !known.has(uri)) {
+        found.push({ uri, name, mode: 'move' });
+      }
+    }
+  }
+  return found;
 }
 
 async function loadAccent(): Promise<string | null> {
@@ -560,6 +626,21 @@ async function reorderUpcoming(library: LibraryTrack[], shuffle: boolean): Promi
 /*  Skin color engine                                                         */
 /* -------------------------------------------------------------------------- */
 
+async function syncAppIcon(color: string): Promise<void> {
+  try {
+    if (!supportsAlternateIcons) {
+      return;
+    }
+    const wanted = ACCENTS.find((option) => option.color === color)?.icon ?? null;
+    if (getAppIconName() === wanted) {
+      return;
+    }
+    await setAlternateAppIcon(wanted);
+  } catch (error) {
+    console.warn('Could not change the app icon', error);
+  }
+}
+
 interface ThemeContextValue {
   accent: string;
   onAccent: string;
@@ -592,10 +673,27 @@ function ThemeProvider({ children }: { children: ReactNode }) {
     };
   }, []);
 
+  const iconTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(
+    () => () => {
+      if (iconTimer.current) {
+        clearTimeout(iconTimer.current);
+      }
+    },
+    [],
+  );
+
   const setAccent = useCallback((color: string) => {
     chosenByUser.current = true;
     setAccentState(color);
     void persistJson(SKIN_URI, { accent: color });
+    if (iconTimer.current) {
+      clearTimeout(iconTimer.current);
+    }
+    iconTimer.current = setTimeout(() => {
+      void syncAppIcon(color);
+    }, ICON_SWITCH_DELAY_MS);
   }, []);
 
   const value = useMemo<ThemeContextValue>(
@@ -1442,6 +1540,7 @@ function AppShell() {
   const tracksRef = useRef<LibraryTrack[]>([]);
   const visibleRef = useRef<LibraryTrack[]>([]);
   const importingRef = useRef(false);
+  const queueRef = useRef<Promise<void>>(Promise.resolve());
 
   useTrackPlayerEvents(REMOTE_EVENTS, (event) => {
     switch (event.type) {
@@ -1520,10 +1619,76 @@ function AppShell() {
     }
   }, [currentTrack, nowPlayingOpen]);
 
+  const processFiles = useCallback(
+    async (files: IncomingFile[]): Promise<string[]> => {
+      if (files.length === 0) {
+        return [];
+      }
+      setImporting(true);
+      const added: LibraryTrack[] = [];
+      const skipped: string[] = [];
+      try {
+        for (const file of files) {
+          try {
+            if (!(await fileExists(file.uri))) {
+              continue;
+            }
+            const id = nextTrackId();
+            const extension = fileExtension(
+              file.name,
+              file.mimeType,
+              AUDIO_MIME_EXTENSIONS,
+              'mp3',
+            );
+            const destination = `${DOC_DIR}${id}.${extension}`;
+            if (file.mode === 'move') {
+              await FileSystem.moveAsync({ from: file.uri, to: destination });
+            } else {
+              try {
+                await FileSystem.copyAsync({ from: file.uri, to: destination });
+              } finally {
+                await removeFile(file.uri);
+              }
+            }
+            const names = parseTrackNames(file.name);
+            added.push({
+              id,
+              title: names.title,
+              artist: names.artist,
+              uri: destination,
+              artwork: null,
+              liked: false,
+            });
+          } catch {
+            skipped.push(file.name);
+          }
+        }
+        if (added.length > 0) {
+          commitTracks((previous) => [...previous, ...added]);
+          await appendToQueue(added);
+        }
+      } finally {
+        setImporting(false);
+      }
+      return skipped;
+    },
+    [commitTracks],
+  );
+
+  const enqueue = useCallback((task: () => Promise<string[]>): Promise<string[]> => {
+    const run = queueRef.current.then(task);
+    queueRef.current = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
+  }, []);
+
   const importSongs = useCallback(async () => {
     if (importingRef.current) {
       return;
     }
+    importingRef.current = true;
     try {
       const result = await DocumentPicker.getDocumentAsync({
         type: 'audio/*',
@@ -1533,47 +1698,51 @@ function AppShell() {
       if (result.canceled) {
         return;
       }
-      importingRef.current = true;
-      setImporting(true);
-      const stamp = Date.now();
-      const added: LibraryTrack[] = [];
-      const skipped: string[] = [];
-      for (let index = 0; index < result.assets.length; index += 1) {
-        const asset = result.assets[index];
-        const id = `${stamp}-${index}`;
-        const extension = fileExtension(asset.name, asset.mimeType, AUDIO_MIME_EXTENSIONS, 'mp3');
-        const destination = `${DOC_DIR}${id}.${extension}`;
-        try {
-          await FileSystem.copyAsync({ from: asset.uri, to: destination });
-          const names = parseTrackNames(asset.name);
-          added.push({
-            id,
-            title: names.title,
-            artist: names.artist,
-            uri: destination,
-            artwork: null,
-            liked: false,
-          });
-        } catch {
-          skipped.push(asset.name);
-        } finally {
-          await removeFile(asset.uri);
-        }
-      }
-      if (added.length > 0) {
-        commitTracks((previous) => [...previous, ...added]);
-        await appendToQueue(added);
-      }
-      if (skipped.length > 0) {
-        Alert.alert('Some files were skipped', skipped.join('\n'));
-      }
+      const files = result.assets.map(
+        (asset): IncomingFile => ({
+          uri: asset.uri,
+          name: asset.name,
+          mimeType: asset.mimeType,
+          mode: 'copy',
+        }),
+      );
+      reportSkipped(await enqueue(() => processFiles(files)));
     } catch (error) {
       Alert.alert('Import failed', errorMessage(error));
     } finally {
       importingRef.current = false;
-      setImporting(false);
     }
-  }, [commitTracks]);
+  }, [enqueue, processFiles]);
+
+  const scanForNewFiles = useCallback(async () => {
+    try {
+      const skipped = await enqueue(async () =>
+        processFiles(await findDroppedAudio(tracksRef.current)),
+      );
+      reportSkipped(skipped);
+    } catch (error) {
+      console.warn('Folder scan failed', error);
+    }
+  }, [enqueue, processFiles]);
+
+  useEffect(() => {
+    if (!hydrated) {
+      return undefined;
+    }
+    void scanForNewFiles();
+    const stateSubscription = AppState.addEventListener('change', (state) => {
+      if (state === 'active') {
+        void scanForNewFiles();
+      }
+    });
+    const linkSubscription = Linking.addEventListener('url', () => {
+      void scanForNewFiles();
+    });
+    return () => {
+      stateSubscription.remove();
+      linkSubscription.remove();
+    };
+  }, [hydrated, scanForNewFiles]);
 
   const playTrack = useCallback(async (id: string) => {
     try {
@@ -1791,8 +1960,8 @@ function AppShell() {
     <View style={styles.empty}>
       <Text style={styles.emptyTitle}>Your songs live here</Text>
       <Text style={styles.emptyBody}>
-        Import audio files from the Files app. They are copied into the app and stay available
-        offline.
+        Import audio files from the Files app or share them to this app from Files or Safari.
+        They are copied into the app and stay available offline.
       </Text>
       <Pressable
         onPress={() => void importSongs()}
