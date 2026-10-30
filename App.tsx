@@ -74,6 +74,12 @@ interface LibraryTrack {
   liked: boolean;
 }
 
+interface Playlist {
+  id: string;
+  name: string;
+  trackIds: string[];
+}
+
 interface AccentOption {
   key: string;
   label: string;
@@ -115,6 +121,7 @@ const FILTERS: readonly { key: FilterKey; label: string }[] = [
 const DOC_DIR = FileSystem.documentDirectory ?? '';
 const METADATA_URI = `${DOC_DIR}tracks_metadata.json`;
 const SKIN_URI = `${DOC_DIR}skin_settings.json`;
+const PLAYLISTS_URI = `${DOC_DIR}playlists.json`;
 const INBOX_URI = `${DOC_DIR}Inbox/`;
 const AUDIO_EXTENSIONS: ReadonlySet<string> = new Set([
   'mp3',
@@ -127,6 +134,7 @@ const AUDIO_EXTENSIONS: ReadonlySet<string> = new Set([
   'caf',
 ]);
 const DEFAULT_ARTIST = 'Unknown Artist';
+const MAX_PLAYLIST_NAME = 60;
 
 const MINI_PLAYER_HEIGHT = 64;
 const MINI_PLAYER_BOTTOM_OFFSET = 8;
@@ -251,6 +259,15 @@ let trackCounter = 0;
 function nextTrackId(): string {
   trackCounter += 1;
   return `${Date.now()}-${trackCounter}`;
+}
+
+function nextPlaylistId(): string {
+  trackCounter += 1;
+  return `pl-${Date.now()}-${trackCounter}`;
+}
+
+function countLabel(count: number): string {
+  return `${count} ${count === 1 ? 'song' : 'songs'}`;
 }
 
 function reportSkipped(skipped: string[]): void {
@@ -390,6 +407,55 @@ async function loadLibrary(): Promise<LibraryTrack[]> {
     return loaded;
   } catch (error) {
     console.warn('Could not read the library file', error);
+    return [];
+  }
+}
+
+function isStoredPlaylist(value: unknown): value is Playlist {
+  if (typeof value !== 'object' || value === null) {
+    return false;
+  }
+  const candidate = value as Record<string, unknown>;
+  return (
+    typeof candidate.id === 'string' &&
+    typeof candidate.name === 'string' &&
+    Array.isArray(candidate.trackIds) &&
+    candidate.trackIds.every((entry) => typeof entry === 'string')
+  );
+}
+
+async function loadPlaylists(validIds: ReadonlySet<string>): Promise<Playlist[]> {
+  try {
+    if (!(await fileExists(PLAYLISTS_URI))) {
+      return [];
+    }
+    const parsed: unknown = JSON.parse(await FileSystem.readAsStringAsync(PLAYLISTS_URI));
+    if (!Array.isArray(parsed)) {
+      return [];
+    }
+    // An empty library usually means it failed to load, so never prune against it.
+    const prune = validIds.size > 0;
+    const loaded: Playlist[] = [];
+    let changed = false;
+    for (const item of parsed) {
+      if (!isStoredPlaylist(item)) {
+        changed = true;
+        continue;
+      }
+      const trackIds = item.trackIds.filter(
+        (id, index, all) => all.indexOf(id) === index && (!prune || validIds.has(id)),
+      );
+      if (trackIds.length !== item.trackIds.length) {
+        changed = true;
+      }
+      loaded.push({ id: item.id, name: item.name, trackIds });
+    }
+    if (changed && prune) {
+      await persistJson(PLAYLISTS_URI, loaded);
+    }
+    return loaded;
+  } catch (error) {
+    console.warn('Could not read the playlists file', error);
     return [];
   }
 }
@@ -1110,17 +1176,470 @@ function MiniPlayer({ track, onOpen, onToggleLike }: MiniPlayerProps) {
 }
 
 /* -------------------------------------------------------------------------- */
-/*  Track options overlay                                                     */
+/*  Sheets, playlist rows and track options                                   */
 /* -------------------------------------------------------------------------- */
+
+interface SheetFrameProps {
+  onClose: () => void;
+  closeLabel: string;
+  children: ReactNode;
+}
+
+function SheetFrame({ onClose, closeLabel, children }: SheetFrameProps) {
+  const insets = useSafeAreaInsets();
+  const slide = useRef(new Animated.Value(48)).current;
+  const fade = useRef(new Animated.Value(0)).current;
+
+  useEffect(() => {
+    Animated.parallel([
+      Animated.timing(slide, { toValue: 0, duration: 200, useNativeDriver: true }),
+      Animated.timing(fade, { toValue: 1, duration: 200, useNativeDriver: true }),
+    ]).start();
+  }, [slide, fade]);
+
+  return (
+    <Animated.View style={[StyleSheet.absoluteFill, styles.overlayBackdrop, { opacity: fade }]}>
+      <KeyboardAvoidingView
+        style={styles.flex}
+        behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+      >
+        <Pressable
+          style={styles.flex}
+          onPress={onClose}
+          accessibilityRole="button"
+          accessibilityLabel={closeLabel}
+        />
+        <Animated.View
+          style={[
+            styles.optionsSheet,
+            { paddingBottom: insets.bottom + 16, transform: [{ translateY: slide }] },
+          ]}
+        >
+          {children}
+        </Animated.View>
+      </KeyboardAvoidingView>
+    </Animated.View>
+  );
+}
+
+function CheckCircle({ checked }: { checked: boolean }) {
+  const { accent, onAccent } = useTheme();
+  return (
+    <View
+      style={[styles.checkCircle, checked && { backgroundColor: accent, borderColor: accent }]}
+    >
+      {checked ? <Ionicons name="checkmark" size={16} color={onAccent} /> : null}
+    </View>
+  );
+}
+
+interface SelectRowProps {
+  title: string;
+  subtitle: string;
+  artwork: string | null;
+  checked: boolean;
+  onPress: () => void;
+}
+
+function SelectRow({ title, subtitle, artwork, checked, onPress }: SelectRowProps) {
+  return (
+    <Pressable
+      onPress={onPress}
+      accessibilityRole="checkbox"
+      accessibilityState={{ checked }}
+      accessibilityLabel={`${title}. ${subtitle}`}
+      style={({ pressed }) => [styles.selectRow, pressed && styles.rowPressed]}
+    >
+      <Artwork uri={artwork} size={40} radius={4} iconSize={18} />
+      <View style={styles.rowText}>
+        <Text numberOfLines={1} style={styles.rowTitle}>
+          {title}
+        </Text>
+        <Text numberOfLines={1} style={[styles.rowSubtitle, styles.rowSubtitleTop]}>
+          {subtitle}
+        </Text>
+      </View>
+      <CheckCircle checked={checked} />
+    </Pressable>
+  );
+}
+
+interface NameFormProps {
+  initial: string;
+  confirmLabel: string;
+  onCancel: () => void;
+  onSubmit: (name: string) => void;
+}
+
+function NameForm({ initial, confirmLabel, onCancel, onSubmit }: NameFormProps) {
+  const { accent, onAccent } = useTheme();
+  const [value, setValue] = useState(initial);
+
+  return (
+    <View style={styles.editForm}>
+      <Text style={styles.fieldLabel}>Name</Text>
+      <TextInput
+        value={value}
+        onChangeText={setValue}
+        style={styles.input}
+        placeholder="Playlist name"
+        placeholderTextColor={PALETTE.textSecondary}
+        selectionColor={accent}
+        autoCapitalize="words"
+        autoFocus
+        maxLength={MAX_PLAYLIST_NAME}
+        returnKeyType="done"
+        onSubmitEditing={() => onSubmit(value)}
+      />
+      <View style={styles.editActions}>
+        <Pressable
+          onPress={onCancel}
+          style={({ pressed }) => [styles.secondaryButton, pressed && styles.pressed]}
+          accessibilityRole="button"
+        >
+          <Text style={styles.secondaryButtonText}>Cancel</Text>
+        </Pressable>
+        <Pressable
+          onPress={() => onSubmit(value)}
+          style={({ pressed }) => [
+            styles.primaryButton,
+            { backgroundColor: accent },
+            pressed && styles.pressed,
+          ]}
+          accessibilityRole="button"
+        >
+          <Text style={[styles.primaryButtonText, { color: onAccent }]}>{confirmLabel}</Text>
+        </Pressable>
+      </View>
+    </View>
+  );
+}
+
+/* ----------------------------- Playlist rows ------------------------------ */
+
+interface ShortcutRowProps {
+  leading: ReactNode;
+  title: string;
+  subtitle: string;
+  onPress: () => void;
+}
+
+function ShortcutRow({ leading, title, subtitle, onPress }: ShortcutRowProps) {
+  return (
+    <Pressable
+      onPress={onPress}
+      accessibilityRole="button"
+      accessibilityLabel={`${title}. ${subtitle}`}
+      style={({ pressed }) => [styles.row, pressed && styles.rowPressed]}
+    >
+      {leading}
+      <View style={styles.rowText}>
+        <Text numberOfLines={1} style={styles.rowTitle}>
+          {title}
+        </Text>
+        <Text numberOfLines={1} style={[styles.rowSubtitle, styles.rowSubtitleTop]}>
+          {subtitle}
+        </Text>
+      </View>
+    </Pressable>
+  );
+}
+
+interface PlaylistRowProps {
+  playlist: Playlist;
+  artwork: string | null;
+  onPress: (id: string) => void;
+  onMore: (id: string) => void;
+}
+
+const PlaylistRow = memo(function PlaylistRow({
+  playlist,
+  artwork,
+  onPress,
+  onMore,
+}: PlaylistRowProps) {
+  const subtitle = `Playlist • ${countLabel(playlist.trackIds.length)}`;
+  return (
+    <Pressable
+      onPress={() => onPress(playlist.id)}
+      accessibilityRole="button"
+      accessibilityLabel={`${playlist.name}. ${subtitle}`}
+      style={({ pressed }) => [styles.row, pressed && styles.rowPressed]}
+    >
+      <Artwork uri={artwork} size={48} radius={4} iconSize={22} />
+      <View style={styles.rowText}>
+        <Text numberOfLines={1} style={styles.rowTitle}>
+          {playlist.name}
+        </Text>
+        <Text numberOfLines={1} style={[styles.rowSubtitle, styles.rowSubtitleTop]}>
+          {subtitle}
+        </Text>
+      </View>
+      <Pressable
+        onPress={() => onMore(playlist.id)}
+        hitSlop={10}
+        accessibilityRole="button"
+        accessibilityLabel={`More options for ${playlist.name}`}
+        style={({ pressed }) => [styles.rowMore, pressed && styles.pressed]}
+      >
+        <Ionicons name="ellipsis-horizontal" size={20} color={PALETTE.textSecondary} />
+      </Pressable>
+    </Pressable>
+  );
+});
+
+interface PlaylistHeaderProps {
+  playlist: Playlist;
+  trackCount: number;
+  onBack: () => void;
+  onPlay: () => void;
+  onShuffle: () => void;
+  onAddSongs: () => void;
+  onMore: () => void;
+}
+
+function PlaylistHeader({
+  playlist,
+  trackCount,
+  onBack,
+  onPlay,
+  onShuffle,
+  onAddSongs,
+  onMore,
+}: PlaylistHeaderProps) {
+  const { accent, onAccent } = useTheme();
+  const empty = trackCount === 0;
+
+  return (
+    <View style={styles.plHeader}>
+      <View style={styles.plTopRow}>
+        <IconButton
+          name="chevron-back"
+          size={26}
+          color={PALETTE.text}
+          label="Back to playlists"
+          onPress={onBack}
+        />
+        <IconButton
+          name="ellipsis-horizontal"
+          size={22}
+          color={PALETTE.text}
+          label="Playlist options"
+          onPress={onMore}
+        />
+      </View>
+      <Text numberOfLines={2} style={styles.plTitle}>
+        {playlist.name}
+      </Text>
+      <Text style={styles.plMeta}>{countLabel(trackCount)}</Text>
+      <View style={styles.plActions}>
+        <Pressable
+          onPress={onAddSongs}
+          accessibilityRole="button"
+          accessibilityLabel="Add songs to this playlist"
+          style={({ pressed }) => [styles.plAddButton, pressed && styles.pressed]}
+        >
+          <Ionicons name="add" size={18} color={PALETTE.text} />
+          <Text style={styles.plAddText}>Add songs</Text>
+        </Pressable>
+        <View style={styles.plPlayGroup}>
+          <IconButton
+            name="shuffle"
+            size={26}
+            color={empty ? '#5A5A5A' : PALETTE.text}
+            label="Shuffle play"
+            onPress={onShuffle}
+          />
+          <Pressable
+            onPress={onPlay}
+            disabled={empty}
+            accessibilityRole="button"
+            accessibilityLabel="Play playlist"
+            style={({ pressed }) => [
+              styles.plPlayButton,
+              { backgroundColor: accent },
+              empty && styles.plPlayDisabled,
+              pressed && styles.wheelPressed,
+            ]}
+          >
+            <Ionicons name="play" size={28} color={onAccent} style={styles.playGlyphNudge} />
+          </Pressable>
+        </View>
+      </View>
+    </View>
+  );
+}
+
+/* ------------------------- Playlist management sheets --------------------- */
+
+type PlaylistSheetState =
+  | { kind: 'create' }
+  | { kind: 'rename'; id: string }
+  | { kind: 'addSongs'; id: string };
+
+interface AddSongsSheetProps {
+  playlist: Playlist;
+  tracks: readonly LibraryTrack[];
+  onSave: (trackIds: string[]) => void;
+  onClose: () => void;
+}
+
+function AddSongsSheet({ playlist, tracks, onSave, onClose }: AddSongsSheetProps) {
+  const { accent, onAccent } = useTheme();
+  const [selected, setSelected] = useState<ReadonlySet<string>>(
+    () => new Set(playlist.trackIds),
+  );
+
+  const toggle = useCallback((id: string) => {
+    setSelected((previous) => {
+      const next = new Set(previous);
+      if (next.has(id)) {
+        next.delete(id);
+      } else {
+        next.add(id);
+      }
+      return next;
+    });
+  }, []);
+
+  const renderItem = useCallback(
+    ({ item }: ListRenderItemInfo<LibraryTrack>) => (
+      <SelectRow
+        title={item.title}
+        subtitle={item.artist}
+        artwork={item.artwork}
+        checked={selected.has(item.id)}
+        onPress={() => toggle(item.id)}
+      />
+    ),
+    [selected, toggle],
+  );
+
+  return (
+    <SheetFrame onClose={onClose} closeLabel="Close">
+      <View style={styles.sheetHeader}>
+        <Text style={styles.sheetTitle}>Add songs</Text>
+        <Text numberOfLines={1} style={styles.rowSubtitle}>
+          {`${playlist.name} • ${selected.size} selected`}
+        </Text>
+      </View>
+      {tracks.length === 0 ? (
+        <Text style={styles.sheetHint}>Import some songs first, then come back to sort them.</Text>
+      ) : (
+        <FlatList
+          data={tracks}
+          keyExtractor={(item) => item.id}
+          renderItem={renderItem}
+          extraData={selected}
+          style={styles.sheetListTall}
+          keyboardShouldPersistTaps="handled"
+        />
+      )}
+      <View style={styles.sheetActions}>
+        <Pressable
+          onPress={onClose}
+          style={({ pressed }) => [styles.secondaryButton, pressed && styles.pressed]}
+          accessibilityRole="button"
+        >
+          <Text style={styles.secondaryButtonText}>Cancel</Text>
+        </Pressable>
+        <Pressable
+          onPress={() => onSave(Array.from(selected))}
+          style={({ pressed }) => [
+            styles.primaryButton,
+            { backgroundColor: accent },
+            pressed && styles.pressed,
+          ]}
+          accessibilityRole="button"
+        >
+          <Text style={[styles.primaryButtonText, { color: onAccent }]}>Save</Text>
+        </Pressable>
+      </View>
+    </SheetFrame>
+  );
+}
+
+interface PlaylistSheetHostProps {
+  state: PlaylistSheetState | null;
+  tracks: readonly LibraryTrack[];
+  playlists: readonly Playlist[];
+  onClose: () => void;
+  onCreate: (name: string) => void;
+  onRename: (id: string, name: string) => void;
+  onSetMembers: (id: string, trackIds: string[]) => void;
+}
+
+function PlaylistSheetHost({
+  state,
+  tracks,
+  playlists,
+  onClose,
+  onCreate,
+  onRename,
+  onSetMembers,
+}: PlaylistSheetHostProps) {
+  if (!state) {
+    return null;
+  }
+  if (state.kind === 'create') {
+    return (
+      <SheetFrame key="create" onClose={onClose} closeLabel="Close">
+        <Text style={[styles.sheetTitle, styles.sheetTitleSolo]}>New playlist</Text>
+        <NameForm initial="" confirmLabel="Create" onCancel={onClose} onSubmit={onCreate} />
+      </SheetFrame>
+    );
+  }
+  const playlist = playlists.find((item) => item.id === state.id);
+  if (!playlist) {
+    return null;
+  }
+  if (state.kind === 'rename') {
+    return (
+      <SheetFrame key={`rename-${playlist.id}`} onClose={onClose} closeLabel="Close">
+        <Text style={[styles.sheetTitle, styles.sheetTitleSolo]}>Rename playlist</Text>
+        <NameForm
+          initial={playlist.name}
+          confirmLabel="Save"
+          onCancel={onClose}
+          onSubmit={(name) => {
+            onRename(playlist.id, name);
+            onClose();
+          }}
+        />
+      </SheetFrame>
+    );
+  }
+  return (
+    <AddSongsSheet
+      key={`add-${playlist.id}`}
+      playlist={playlist}
+      tracks={tracks}
+      onClose={onClose}
+      onSave={(trackIds) => {
+        onSetMembers(playlist.id, trackIds);
+        onClose();
+      }}
+    />
+  );
+}
+
+/* ---------------------------- Track options sheet ------------------------- */
+
+type OptionsMode = 'menu' | 'edit' | 'playlists' | 'newPlaylist';
 
 interface OptionsOverlayProps {
   visible: boolean;
   track: LibraryTrack | null;
+  playlists: readonly Playlist[];
+  currentPlaylistName: string | null;
   onClose: () => void;
   onToggleLike: (id: string) => void;
   onSaveDetails: (id: string, title: string, artist: string) => void;
   onPickArtwork: (id: string) => void;
   onRemove: (id: string) => void;
+  onTogglePlaylist: (playlistId: string, trackId: string) => void;
+  onCreatePlaylist: (name: string, trackId: string) => void;
+  onRemoveFromPlaylist: (trackId: string) => void;
 }
 
 function TrackOptionsOverlay(props: OptionsOverlayProps) {
@@ -1136,136 +1655,183 @@ interface OptionsSheetProps extends OptionsOverlayProps {
 
 function OptionsSheet({
   track,
+  playlists,
+  currentPlaylistName,
   onClose,
   onToggleLike,
   onSaveDetails,
   onPickArtwork,
   onRemove,
+  onTogglePlaylist,
+  onCreatePlaylist,
+  onRemoveFromPlaylist,
 }: OptionsSheetProps) {
   const { accent, onAccent } = useTheme();
-  const insets = useSafeAreaInsets();
-  const [mode, setMode] = useState<'menu' | 'edit'>('menu');
+  const [mode, setMode] = useState<OptionsMode>('menu');
   const [title, setTitle] = useState(track.title);
   const [artist, setArtist] = useState(track.artist);
-  const slide = useRef(new Animated.Value(48)).current;
-  const fade = useRef(new Animated.Value(0)).current;
-
-  useEffect(() => {
-    Animated.parallel([
-      Animated.timing(slide, { toValue: 0, duration: 200, useNativeDriver: true }),
-      Animated.timing(fade, { toValue: 1, duration: 200, useNativeDriver: true }),
-    ]).start();
-  }, [slide, fade]);
 
   const runAndClose = (action: () => void) => () => {
     onClose();
     action();
   };
 
-  return (
-    <Animated.View style={[StyleSheet.absoluteFill, styles.overlayBackdrop, { opacity: fade }]}>
-      <KeyboardAvoidingView
-        style={styles.flex}
-        behavior={Platform.OS === 'ios' ? 'padding' : undefined}
-      >
-        <Pressable
-          style={styles.flex}
-          onPress={onClose}
-          accessibilityRole="button"
-          accessibilityLabel="Close options"
-        />
-        <Animated.View
-          style={[
-            styles.optionsSheet,
-            { paddingBottom: insets.bottom + 16, transform: [{ translateY: slide }] },
-          ]}
-        >
-          <View style={styles.optionsHeader}>
-            <Artwork uri={track.artwork} size={48} radius={4} iconSize={22} />
-            <View style={styles.rowText}>
-              <Text numberOfLines={1} style={styles.optionsTitle}>
-                {track.title}
-              </Text>
-              <Text numberOfLines={1} style={styles.rowSubtitle}>
-                {track.artist}
-              </Text>
+  const renderBody = (): ReactNode => {
+    switch (mode) {
+      case 'menu':
+        return (
+          <View>
+            <OptionRow
+              icon={track.liked ? 'heart-dislike-outline' : 'heart-outline'}
+              label={track.liked ? 'Remove from Liked Songs' : 'Add to Liked Songs'}
+              onPress={runAndClose(() => onToggleLike(track.id))}
+            />
+            <OptionRow
+              icon="add-circle-outline"
+              label="Add to playlist"
+              onPress={() => setMode('playlists')}
+            />
+            {currentPlaylistName !== null ? (
+              <OptionRow
+                icon="remove-circle-outline"
+                label={`Remove from ${currentPlaylistName}`}
+                onPress={runAndClose(() => onRemoveFromPlaylist(track.id))}
+              />
+            ) : null}
+            <OptionRow
+              icon="create-outline"
+              label="Edit title and artist"
+              onPress={() => setMode('edit')}
+            />
+            <OptionRow
+              icon="image-outline"
+              label="Choose artwork"
+              onPress={runAndClose(() => onPickArtwork(track.id))}
+            />
+            <OptionRow
+              icon="trash-outline"
+              label="Remove from library"
+              onPress={runAndClose(() => onRemove(track.id))}
+            />
+          </View>
+        );
+      case 'edit':
+        return (
+          <View style={styles.editForm}>
+            <Text style={styles.fieldLabel}>Title</Text>
+            <TextInput
+              value={title}
+              onChangeText={setTitle}
+              style={styles.input}
+              placeholder="Title"
+              placeholderTextColor={PALETTE.textSecondary}
+              selectionColor={accent}
+              autoCapitalize="words"
+              returnKeyType="next"
+            />
+            <Text style={styles.fieldLabel}>Artist</Text>
+            <TextInput
+              value={artist}
+              onChangeText={setArtist}
+              style={styles.input}
+              placeholder="Artist"
+              placeholderTextColor={PALETTE.textSecondary}
+              selectionColor={accent}
+              autoCapitalize="words"
+              returnKeyType="done"
+            />
+            <View style={styles.editActions}>
+              <Pressable
+                onPress={() => setMode('menu')}
+                style={({ pressed }) => [styles.secondaryButton, pressed && styles.pressed]}
+                accessibilityRole="button"
+              >
+                <Text style={styles.secondaryButtonText}>Cancel</Text>
+              </Pressable>
+              <Pressable
+                onPress={() => {
+                  onSaveDetails(track.id, title, artist);
+                  onClose();
+                }}
+                style={({ pressed }) => [
+                  styles.primaryButton,
+                  { backgroundColor: accent },
+                  pressed && styles.pressed,
+                ]}
+                accessibilityRole="button"
+              >
+                <Text style={[styles.primaryButtonText, { color: onAccent }]}>Save</Text>
+              </Pressable>
             </View>
           </View>
-          {mode === 'menu' ? (
-            <View>
-              <OptionRow
-                icon={track.liked ? 'heart-dislike-outline' : 'heart-outline'}
-                label={track.liked ? 'Remove from Liked Songs' : 'Add to Liked Songs'}
-                onPress={runAndClose(() => onToggleLike(track.id))}
-              />
-              <OptionRow
-                icon="create-outline"
-                label="Edit title and artist"
-                onPress={() => setMode('edit')}
-              />
-              <OptionRow
-                icon="image-outline"
-                label="Choose artwork"
-                onPress={runAndClose(() => onPickArtwork(track.id))}
-              />
-              <OptionRow
-                icon="trash-outline"
-                label="Remove from library"
-                onPress={runAndClose(() => onRemove(track.id))}
-              />
+        );
+      case 'playlists':
+        return (
+          <View>
+            <OptionRow icon="add" label="New playlist" onPress={() => setMode('newPlaylist')} />
+            {playlists.length === 0 ? (
+              <Text style={styles.sheetHint}>
+                No playlists yet. Create one to start sorting your songs.
+              </Text>
+            ) : (
+              <ScrollView style={styles.sheetList} keyboardShouldPersistTaps="handled">
+                {playlists.map((playlist) => (
+                  <SelectRow
+                    key={playlist.id}
+                    title={playlist.name}
+                    subtitle={countLabel(playlist.trackIds.length)}
+                    artwork={null}
+                    checked={playlist.trackIds.includes(track.id)}
+                    onPress={() => onTogglePlaylist(playlist.id, track.id)}
+                  />
+                ))}
+              </ScrollView>
+            )}
+            <View style={styles.sheetActions}>
+              <Pressable
+                onPress={onClose}
+                style={({ pressed }) => [
+                  styles.primaryButton,
+                  { backgroundColor: accent },
+                  pressed && styles.pressed,
+                ]}
+                accessibilityRole="button"
+              >
+                <Text style={[styles.primaryButtonText, { color: onAccent }]}>Done</Text>
+              </Pressable>
             </View>
-          ) : (
-            <View style={styles.editForm}>
-              <Text style={styles.fieldLabel}>Title</Text>
-              <TextInput
-                value={title}
-                onChangeText={setTitle}
-                style={styles.input}
-                placeholder="Title"
-                placeholderTextColor={PALETTE.textSecondary}
-                selectionColor={accent}
-                autoCapitalize="words"
-                returnKeyType="next"
-              />
-              <Text style={styles.fieldLabel}>Artist</Text>
-              <TextInput
-                value={artist}
-                onChangeText={setArtist}
-                style={styles.input}
-                placeholder="Artist"
-                placeholderTextColor={PALETTE.textSecondary}
-                selectionColor={accent}
-                autoCapitalize="words"
-                returnKeyType="done"
-              />
-              <View style={styles.editActions}>
-                <Pressable
-                  onPress={() => setMode('menu')}
-                  style={({ pressed }) => [styles.secondaryButton, pressed && styles.pressed]}
-                  accessibilityRole="button"
-                >
-                  <Text style={styles.secondaryButtonText}>Cancel</Text>
-                </Pressable>
-                <Pressable
-                  onPress={() => {
-                    onSaveDetails(track.id, title, artist);
-                    onClose();
-                  }}
-                  style={({ pressed }) => [
-                    styles.primaryButton,
-                    { backgroundColor: accent },
-                    pressed && styles.pressed,
-                  ]}
-                  accessibilityRole="button"
-                >
-                  <Text style={[styles.primaryButtonText, { color: onAccent }]}>Save</Text>
-                </Pressable>
-              </View>
-            </View>
-          )}
-        </Animated.View>
-      </KeyboardAvoidingView>
-    </Animated.View>
+          </View>
+        );
+      case 'newPlaylist':
+        return (
+          <NameForm
+            initial=""
+            confirmLabel="Create"
+            onCancel={() => setMode('playlists')}
+            onSubmit={(name) => {
+              onCreatePlaylist(name, track.id);
+              onClose();
+            }}
+          />
+        );
+    }
+  };
+
+  return (
+    <SheetFrame onClose={onClose} closeLabel="Close options">
+      <View style={styles.optionsHeader}>
+        <Artwork uri={track.artwork} size={48} radius={4} iconSize={22} />
+        <View style={styles.rowText}>
+          <Text numberOfLines={1} style={styles.optionsTitle}>
+            {track.title}
+          </Text>
+          <Text numberOfLines={1} style={styles.rowSubtitle}>
+            {track.artist}
+          </Text>
+        </View>
+      </View>
+      {renderBody()}
+    </SheetFrame>
   );
 }
 
@@ -1277,7 +1843,9 @@ function OptionRow({ icon, label, onPress }: { icon: IconName; label: string; on
       style={({ pressed }) => [styles.optionRow, pressed && styles.rowPressed]}
     >
       <Ionicons name={icon} size={24} color={PALETTE.text} />
-      <Text style={styles.optionLabel}>{label}</Text>
+      <Text numberOfLines={1} style={styles.optionLabel}>
+        {label}
+      </Text>
     </Pressable>
   );
 }
@@ -1536,8 +2104,13 @@ function AppShell() {
   const [optionsId, setOptionsId] = useState<string | null>(null);
   const [shuffleOn, setShuffleOn] = useState(false);
   const [repeatMode, setRepeatMode] = useState<RepeatMode>(RepeatMode.Off);
+  const [playlists, setPlaylists] = useState<Playlist[]>([]);
+  const [openPlaylistId, setOpenPlaylistId] = useState<string | null>(null);
+  const [playlistSheet, setPlaylistSheet] = useState<PlaylistSheetState | null>(null);
 
   const tracksRef = useRef<LibraryTrack[]>([]);
+  const playlistsRef = useRef<Playlist[]>([]);
+  const queueContextRef = useRef<string[]>([]);
   const visibleRef = useRef<LibraryTrack[]>([]);
   const importingRef = useRef(false);
   const queueRef = useRef<Promise<void>>(Promise.resolve());
@@ -1579,9 +2152,12 @@ function AppShell() {
         }
       }
       const loaded = await loadLibrary();
+      const loadedPlaylists = await loadPlaylists(new Set(loaded.map((track) => track.id)));
       if (!cancelled) {
         tracksRef.current = loaded;
+        playlistsRef.current = loadedPlaylists;
         setTracks(loaded);
+        setPlaylists(loadedPlaylists);
         setHydrated(true);
       }
     })();
@@ -1597,11 +2173,116 @@ function AppShell() {
     void persistJson(METADATA_URI, next);
   }, []);
 
-  const visibleTracks = useMemo(
-    () => (likedOnly ? tracks.filter((track) => track.liked) : tracks),
-    [tracks, likedOnly],
+  const commitPlaylists = useCallback((updater: (previous: Playlist[]) => Playlist[]) => {
+    const next = updater(playlistsRef.current);
+    playlistsRef.current = next;
+    setPlaylists(next);
+    void persistJson(PLAYLISTS_URI, next);
+  }, []);
+
+  const createPlaylist = useCallback(
+    (name: string, firstTrackId: string | null): string => {
+      const trimmed = name.trim().slice(0, MAX_PLAYLIST_NAME);
+      const playlist: Playlist = {
+        id: nextPlaylistId(),
+        name: trimmed || `Playlist ${playlistsRef.current.length + 1}`,
+        trackIds: firstTrackId ? [firstTrackId] : [],
+      };
+      commitPlaylists((previous) => [...previous, playlist]);
+      return playlist.id;
+    },
+    [commitPlaylists],
   );
+
+  const renamePlaylist = useCallback(
+    (id: string, name: string) => {
+      const trimmed = name.trim().slice(0, MAX_PLAYLIST_NAME);
+      if (!trimmed) {
+        return;
+      }
+      commitPlaylists((previous) =>
+        previous.map((playlist) => (playlist.id === id ? { ...playlist, name: trimmed } : playlist)),
+      );
+    },
+    [commitPlaylists],
+  );
+
+  const deletePlaylist = useCallback(
+    (id: string) => {
+      commitPlaylists((previous) => previous.filter((playlist) => playlist.id !== id));
+      setOpenPlaylistId((previous) => (previous === id ? null : previous));
+    },
+    [commitPlaylists],
+  );
+
+  const togglePlaylistTrack = useCallback(
+    (playlistId: string, trackId: string) => {
+      commitPlaylists((previous) =>
+        previous.map((playlist) => {
+          if (playlist.id !== playlistId) {
+            return playlist;
+          }
+          return playlist.trackIds.includes(trackId)
+            ? { ...playlist, trackIds: playlist.trackIds.filter((entry) => entry !== trackId) }
+            : { ...playlist, trackIds: [...playlist.trackIds, trackId] };
+        }),
+      );
+    },
+    [commitPlaylists],
+  );
+
+  const setPlaylistMembers = useCallback(
+    (id: string, selected: string[]) => {
+      const wanted = new Set(selected);
+      commitPlaylists((previous) =>
+        previous.map((playlist) => {
+          if (playlist.id !== id) {
+            return playlist;
+          }
+          const kept = playlist.trackIds.filter((entry) => wanted.has(entry));
+          const keptSet = new Set(kept);
+          const added = tracksRef.current
+            .map((track) => track.id)
+            .filter((entry) => wanted.has(entry) && !keptSet.has(entry));
+          return { ...playlist, trackIds: [...kept, ...added] };
+        }),
+      );
+    },
+    [commitPlaylists],
+  );
+
+  const openPlaylist = useMemo(
+    () => playlists.find((playlist) => playlist.id === openPlaylistId) ?? null,
+    [playlists, openPlaylistId],
+  );
+
+  const visibleTracks = useMemo(() => {
+    if (openPlaylist) {
+      const byId = new Map(tracks.map((track) => [track.id, track] as const));
+      return openPlaylist.trackIds
+        .map((id) => byId.get(id))
+        .filter((track): track is LibraryTrack => track !== undefined);
+    }
+    return likedOnly ? tracks.filter((track) => track.liked) : tracks;
+  }, [tracks, likedOnly, openPlaylist]);
   visibleRef.current = visibleTracks;
+
+  const playlistArtwork = useMemo(() => {
+    const artworkById = new Map(tracks.map((track) => [track.id, track.artwork] as const));
+    const result = new Map<string, string | null>();
+    for (const playlist of playlists) {
+      let found: string | null = null;
+      for (const id of playlist.trackIds) {
+        const art = artworkById.get(id);
+        if (art) {
+          found = art;
+          break;
+        }
+      }
+      result.set(playlist.id, found);
+    }
+    return result;
+  }, [tracks, playlists]);
 
   const likedCount = useMemo(() => tracks.filter((track) => track.liked).length, [tracks]);
   const currentTrack = useMemo(
@@ -1744,6 +2425,25 @@ function AppShell() {
     };
   }, [hydrated, scanForNewFiles]);
 
+  const orderingSource = useCallback((): LibraryTrack[] => {
+    const byId = new Map(tracksRef.current.map((track) => [track.id, track] as const));
+    const ordered: LibraryTrack[] = [];
+    const seen = new Set<string>();
+    for (const id of queueContextRef.current) {
+      const track = byId.get(id);
+      if (track && !seen.has(id)) {
+        ordered.push(track);
+        seen.add(id);
+      }
+    }
+    for (const track of tracksRef.current) {
+      if (!seen.has(track.id)) {
+        ordered.push(track);
+      }
+    }
+    return ordered;
+  }, []);
+
   const playTrack = useCallback(async (id: string) => {
     try {
       await setupTrackPlayer();
@@ -1761,6 +2461,7 @@ function AppShell() {
       const queuedIds = new Set(queue.map((item) => item.id));
       const sameContext =
         queue.length === context.length && context.every((track) => queuedIds.has(track.id));
+      queueContextRef.current = context.map((track) => track.id);
       if (sameContext) {
         await TrackPlayer.skip(queue.findIndex((item) => item.id === id));
       } else {
@@ -1768,14 +2469,31 @@ function AppShell() {
         await TrackPlayer.add(context.map(toPlayerTrack));
         await TrackPlayer.skip(index);
         if (shuffleOn) {
-          await reorderUpcoming(tracksRef.current, true);
+          await reorderUpcoming(orderingSource(), true);
         }
       }
       await TrackPlayer.play();
     } catch (error) {
       Alert.alert('Playback failed', errorMessage(error));
     }
-  }, [shuffleOn]);
+  }, [shuffleOn, orderingSource]);
+
+  const playContext = useCallback(async (shuffle: boolean) => {
+    const context = visibleRef.current;
+    if (context.length === 0) {
+      return;
+    }
+    try {
+      await setupTrackPlayer();
+      await TrackPlayer.reset();
+      await TrackPlayer.add((shuffle ? shuffled(context) : context).map(toPlayerTrack));
+      queueContextRef.current = context.map((track) => track.id);
+      setShuffleOn(shuffle);
+      await TrackPlayer.play();
+    } catch (error) {
+      Alert.alert('Playback failed', errorMessage(error));
+    }
+  }, []);
 
   const toggleLike = useCallback(
     (id: string) => {
@@ -1847,10 +2565,19 @@ function AppShell() {
       }
       await removeFromQueue(id);
       commitTracks((previous) => previous.filter((track) => track.id !== id));
+      if (playlistsRef.current.some((playlist) => playlist.trackIds.includes(id))) {
+        commitPlaylists((previous) =>
+          previous.map((playlist) =>
+            playlist.trackIds.includes(id)
+              ? { ...playlist, trackIds: playlist.trackIds.filter((entry) => entry !== id) }
+              : playlist,
+          ),
+        );
+      }
       await removeFile(target.uri);
       await removeFile(target.artwork);
     },
-    [commitTracks],
+    [commitTracks, commitPlaylists],
   );
 
   const confirmRemove = useCallback(
@@ -1870,8 +2597,8 @@ function AppShell() {
   const toggleShuffle = useCallback(() => {
     const next = !shuffleOn;
     setShuffleOn(next);
-    void reorderUpcoming(tracksRef.current, next);
-  }, [shuffleOn]);
+    void reorderUpcoming(orderingSource(), next);
+  }, [shuffleOn, orderingSource]);
 
   const cycleRepeat = useCallback(async () => {
     const next =
@@ -1888,15 +2615,94 @@ function AppShell() {
     }
   }, [repeatMode]);
 
-  const selectFilter = useCallback((key: FilterKey) => {
-    setLikedOnly(false);
-    setFilter((previous) => (previous === key ? null : key));
-  }, []);
+  const selectFilter = useCallback(
+    (key: FilterKey) => {
+      setLikedOnly(false);
+      if (key === 'playlists' && openPlaylistId !== null) {
+        setOpenPlaylistId(null);
+        return;
+      }
+      setOpenPlaylistId(null);
+      setFilter((previous) => (previous === key ? null : key));
+    },
+    [openPlaylistId],
+  );
 
   const openLiked = useCallback(() => {
+    setOpenPlaylistId(null);
     setFilter(null);
     setLikedOnly((previous) => !previous);
   }, []);
+
+  const showLiked = useCallback(() => {
+    setOpenPlaylistId(null);
+    setFilter(null);
+    setLikedOnly(true);
+  }, []);
+
+  const showPlaylist = useCallback((id: string) => {
+    setLikedOnly(false);
+    setFilter('playlists');
+    setOpenPlaylistId(id);
+  }, []);
+
+  const closePlaylist = useCallback(() => setOpenPlaylistId(null), []);
+  const closePlaylistSheet = useCallback(() => setPlaylistSheet(null), []);
+
+  const submitNewPlaylist = useCallback(
+    (name: string) => {
+      const id = createPlaylist(name, null);
+      showPlaylist(id);
+      setPlaylistSheet(tracksRef.current.length > 0 ? { kind: 'addSongs', id } : null);
+    },
+    [createPlaylist, showPlaylist],
+  );
+
+  const confirmDeletePlaylist = useCallback(
+    (id: string) => {
+      const target = playlistsRef.current.find((playlist) => playlist.id === id);
+      if (!target) {
+        return;
+      }
+      Alert.alert('Delete playlist', `"${target.name}" will be deleted. Your songs stay in the library.`, [
+        { text: 'Cancel', style: 'cancel' },
+        { text: 'Delete', style: 'destructive', onPress: () => deletePlaylist(id) },
+      ]);
+    },
+    [deletePlaylist],
+  );
+
+  const openPlaylistMenu = useCallback(
+    (id: string) => {
+      const target = playlistsRef.current.find((playlist) => playlist.id === id);
+      if (!target) {
+        return;
+      }
+      Alert.alert(target.name, undefined, [
+        { text: 'Add songs', onPress: () => setPlaylistSheet({ kind: 'addSongs', id }) },
+        { text: 'Rename', onPress: () => setPlaylistSheet({ kind: 'rename', id }) },
+        { text: 'Delete playlist', style: 'destructive', onPress: () => confirmDeletePlaylist(id) },
+        { text: 'Cancel', style: 'cancel' },
+      ]);
+    },
+    [confirmDeletePlaylist],
+  );
+
+  const removeFromOpenPlaylist = useCallback(
+    (trackId: string) => {
+      if (openPlaylistId === null) {
+        return;
+      }
+      commitPlaylists((previous) =>
+        previous.map((playlist) =>
+          playlist.id === openPlaylistId
+            ? { ...playlist, trackIds: playlist.trackIds.filter((entry) => entry !== trackId) }
+            : playlist,
+        ),
+      );
+    },
+    [openPlaylistId, commitPlaylists],
+  );
 
   const openOptions = useCallback((id: string) => setOptionsId(id), []);
   const closeOptions = useCallback(() => setOptionsId(null), []);
@@ -1904,8 +2710,8 @@ function AppShell() {
   const closeNowPlaying = useCallback(() => setNowPlayingOpen(false), []);
   const toggleTray = useCallback(() => setTrayOpen((previous) => !previous), []);
 
-  const showGrid = filter === null || filter === 'playlists';
-  const listData = filter === 'playlists' ? [] : visibleTracks;
+  const inPlaylistsTab = filter === 'playlists' && openPlaylist === null;
+  const showGrid = filter === null && openPlaylist === null;
   const showDownloaded = filter === 'downloaded';
 
   const renderItem = useCallback(
@@ -1924,9 +2730,77 @@ function AppShell() {
   );
 
   const keyExtractor = useCallback((item: LibraryTrack) => item.id, []);
+  const playlistKeyExtractor = useCallback((item: Playlist) => item.id, []);
+
+  const renderPlaylist = useCallback(
+    ({ item }: ListRenderItemInfo<Playlist>) => (
+      <PlaylistRow
+        playlist={item}
+        artwork={playlistArtwork.get(item.id) ?? null}
+        onPress={showPlaylist}
+        onMore={openPlaylistMenu}
+      />
+    ),
+    [playlistArtwork, showPlaylist, openPlaylistMenu],
+  );
+
+  const playlistsHeader = (
+    <View style={styles.playlistsTop}>
+      <ShortcutRow
+        leading={
+          <View style={styles.newPlaylistArt}>
+            <Ionicons name="add" size={26} color={accent} />
+          </View>
+        }
+        title="New playlist"
+        subtitle="Sort your songs into a playlist"
+        onPress={() => setPlaylistSheet({ kind: 'create' })}
+      />
+      <ShortcutRow
+        leading={
+          <View style={styles.likedArt}>
+            <LinearGradient
+              colors={['#35108F', '#8057F0']}
+              start={{ x: 0, y: 0 }}
+              end={{ x: 1, y: 1 }}
+              style={StyleSheet.absoluteFill}
+            />
+            <Ionicons name="heart" size={22} color="#FFFFFF" />
+          </View>
+        }
+        title="Liked Songs"
+        subtitle={`Playlist • ${countLabel(likedCount)}`}
+        onPress={showLiked}
+      />
+    </View>
+  );
+
+  const playlistsEmpty = !hydrated ? (
+    <View style={styles.empty}>
+      <ActivityIndicator color={accent} />
+    </View>
+  ) : (
+    <View style={styles.empty}>
+      <Text style={styles.emptyTitle}>No playlists yet</Text>
+      <Text style={styles.emptyBody}>
+        Tap New playlist above, or open the menu on any song and choose Add to playlist.
+      </Text>
+    </View>
+  );
 
   const listHeader = (
     <View>
+      {openPlaylist ? (
+        <PlaylistHeader
+          playlist={openPlaylist}
+          trackCount={visibleTracks.length}
+          onBack={closePlaylist}
+          onPlay={() => void playContext(false)}
+          onShuffle={() => void playContext(true)}
+          onAddSongs={() => setPlaylistSheet({ kind: 'addSongs', id: openPlaylist.id })}
+          onMore={() => openPlaylistMenu(openPlaylist.id)}
+        />
+      ) : null}
       {showGrid ? (
         <LibraryGrid
           likedCount={likedCount}
@@ -1951,7 +2825,24 @@ function AppShell() {
     <View style={styles.empty}>
       <ActivityIndicator color={accent} />
     </View>
-  ) : filter === 'playlists' ? null : likedOnly ? (
+  ) : openPlaylist ? (
+    <View style={styles.empty}>
+      <Text style={styles.emptyTitle}>This playlist is empty</Text>
+      <Text style={styles.emptyBody}>Add songs from your library to start listening.</Text>
+      <Pressable
+        onPress={() => setPlaylistSheet({ kind: 'addSongs', id: openPlaylist.id })}
+        accessibilityRole="button"
+        style={({ pressed }) => [
+          styles.primaryButton,
+          styles.emptyButton,
+          { backgroundColor: accent },
+          pressed && styles.pressed,
+        ]}
+      >
+        <Text style={[styles.primaryButtonText, { color: onAccent }]}>Add songs</Text>
+      </Pressable>
+    </View>
+  ) : likedOnly ? (
     <View style={styles.empty}>
       <Text style={styles.emptyTitle}>No liked songs yet</Text>
       <Text style={styles.emptyBody}>Tap the heart on any track to save it here.</Text>
@@ -1978,6 +2869,27 @@ function AppShell() {
     </View>
   );
 
+  const renderOptions = (visible: boolean, fromLibrary: boolean) => (
+    <TrackOptionsOverlay
+      visible={visible}
+      track={optionsTrack}
+      playlists={playlists}
+      currentPlaylistName={
+        fromLibrary && openPlaylist && optionsTrack && openPlaylist.trackIds.includes(optionsTrack.id)
+          ? openPlaylist.name
+          : null
+      }
+      onClose={closeOptions}
+      onToggleLike={toggleLike}
+      onSaveDetails={saveDetails}
+      onPickArtwork={(id) => void pickArtwork(id)}
+      onRemove={confirmRemove}
+      onTogglePlaylist={togglePlaylistTrack}
+      onCreatePlaylist={createPlaylist}
+      onRemoveFromPlaylist={removeFromOpenPlaylist}
+    />
+  );
+
   const listBottomPadding = currentTrack
     ? MINI_PLAYER_HEIGHT + MINI_PLAYER_BOTTOM_OFFSET + insets.bottom + 24
     : insets.bottom + 24;
@@ -1996,17 +2908,31 @@ function AppShell() {
       {playerError ? (
         <Text style={styles.errorBanner}>{`Player unavailable: ${playerError}`}</Text>
       ) : null}
-      <FlatList
-        data={listData}
-        keyExtractor={keyExtractor}
-        renderItem={renderItem}
-        ListHeaderComponent={listHeader}
-        ListEmptyComponent={emptyState ?? undefined}
-        contentContainerStyle={{ paddingBottom: listBottomPadding }}
-        initialNumToRender={14}
-        windowSize={9}
-        keyboardShouldPersistTaps="handled"
-      />
+      {inPlaylistsTab ? (
+        <FlatList
+          key="playlists"
+          data={playlists}
+          keyExtractor={playlistKeyExtractor}
+          renderItem={renderPlaylist}
+          ListHeaderComponent={playlistsHeader}
+          ListEmptyComponent={playlistsEmpty}
+          contentContainerStyle={{ paddingBottom: listBottomPadding }}
+          keyboardShouldPersistTaps="handled"
+        />
+      ) : (
+        <FlatList
+          key="tracks"
+          data={visibleTracks}
+          keyExtractor={keyExtractor}
+          renderItem={renderItem}
+          ListHeaderComponent={listHeader}
+          ListEmptyComponent={emptyState}
+          contentContainerStyle={{ paddingBottom: listBottomPadding }}
+          initialNumToRender={14}
+          windowSize={9}
+          keyboardShouldPersistTaps="handled"
+        />
+      )}
       {currentTrack ? (
         <MiniPlayer track={currentTrack} onOpen={openNowPlaying} onToggleLike={toggleLike} />
       ) : null}
@@ -2020,26 +2946,17 @@ function AppShell() {
         onToggleShuffle={toggleShuffle}
         onCycleRepeat={() => void cycleRepeat()}
         onMore={openOptions}
-        optionsOverlay={
-          <TrackOptionsOverlay
-            visible={nowPlayingOpen && optionsId !== null}
-            track={optionsTrack}
-            onClose={closeOptions}
-            onToggleLike={toggleLike}
-            onSaveDetails={saveDetails}
-            onPickArtwork={(id) => void pickArtwork(id)}
-            onRemove={confirmRemove}
-          />
-        }
+        optionsOverlay={renderOptions(nowPlayingOpen && optionsId !== null, false)}
       />
-      <TrackOptionsOverlay
-        visible={!nowPlayingOpen && optionsId !== null}
-        track={optionsTrack}
-        onClose={closeOptions}
-        onToggleLike={toggleLike}
-        onSaveDetails={saveDetails}
-        onPickArtwork={(id) => void pickArtwork(id)}
-        onRemove={confirmRemove}
+      {renderOptions(!nowPlayingOpen && optionsId !== null, true)}
+      <PlaylistSheetHost
+        state={playlistSheet}
+        tracks={tracks}
+        playlists={playlists}
+        onClose={closePlaylistSheet}
+        onCreate={submitNewPlaylist}
+        onRename={renamePlaylist}
+        onSetMembers={setPlaylistMembers}
       />
     </View>
   );
@@ -2229,7 +3146,7 @@ const styles = StyleSheet.create({
     paddingHorizontal: 16,
     height: 56,
   },
-  optionLabel: { color: PALETTE.text, fontSize: 16, fontWeight: '500' },
+  optionLabel: { color: PALETTE.text, fontSize: 16, fontWeight: '500', flexShrink: 1 },
   editForm: { paddingHorizontal: 16, paddingTop: 12 },
   fieldLabel: {
     color: PALETTE.textSecondary,
@@ -2353,4 +3270,95 @@ const styles = StyleSheet.create({
     elevation: 10,
   },
   playGlyphNudge: { marginLeft: 4 },
+
+  rowSubtitleTop: { marginTop: 2 },
+  sheetTitle: { color: PALETTE.text, fontSize: 18, fontWeight: '800' },
+  sheetTitleSolo: { paddingHorizontal: 16 },
+  sheetHeader: { paddingHorizontal: 16, paddingBottom: 12, gap: 2 },
+  sheetHint: {
+    color: PALETTE.textSecondary,
+    fontSize: 14,
+    lineHeight: 20,
+    paddingHorizontal: 16,
+    paddingVertical: 12,
+  },
+  sheetList: { maxHeight: 260 },
+  sheetListTall: { maxHeight: 380 },
+  sheetActions: {
+    flexDirection: 'row',
+    justifyContent: 'flex-end',
+    gap: 12,
+    paddingHorizontal: 16,
+    paddingTop: 16,
+  },
+  selectRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+    paddingHorizontal: 16,
+    paddingVertical: 8,
+  },
+  checkCircle: {
+    width: 24,
+    height: 24,
+    borderRadius: 12,
+    borderWidth: 2,
+    borderColor: '#7A7A7A',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+
+  plHeader: { paddingHorizontal: 16, paddingBottom: 12 },
+  plTopRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginHorizontal: -8,
+  },
+  plTitle: { color: PALETTE.text, fontSize: 28, fontWeight: '800', letterSpacing: -0.5, marginTop: 4 },
+  plMeta: { color: PALETTE.textSecondary, fontSize: 14, marginTop: 4 },
+  plActions: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    marginTop: 16,
+  },
+  plAddButton: {
+    height: 36,
+    paddingHorizontal: 14,
+    borderRadius: 18,
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.4)',
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+  },
+  plAddText: { color: PALETTE.text, fontSize: 14, fontWeight: '700' },
+  plPlayGroup: { flexDirection: 'row', alignItems: 'center', gap: 8 },
+  plPlayButton: {
+    width: 56,
+    height: 56,
+    borderRadius: 28,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  plPlayDisabled: { opacity: 0.4 },
+
+  playlistsTop: { paddingTop: 4 },
+  newPlaylistArt: {
+    width: 48,
+    height: 48,
+    borderRadius: 4,
+    backgroundColor: PALETTE.subCard,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  likedArt: {
+    width: 48,
+    height: 48,
+    borderRadius: 4,
+    overflow: 'hidden',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
 });
