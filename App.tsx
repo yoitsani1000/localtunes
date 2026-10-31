@@ -8,7 +8,7 @@ import {
   useRef,
   useState,
 } from 'react';
-import type { ComponentProps, ReactNode } from 'react';
+import type { ComponentProps, ComponentRef, ReactNode } from 'react';
 import {
   ActivityIndicator,
   Alert,
@@ -30,7 +30,15 @@ import {
   View,
   useWindowDimensions,
 } from 'react-native';
-import type { AlertButton, ListRenderItemInfo, StyleProp, ViewStyle } from 'react-native';
+import type {
+  AlertButton,
+  LayoutChangeEvent,
+  ListRenderItemInfo,
+  NativeScrollEvent,
+  NativeSyntheticEvent,
+  StyleProp,
+  ViewStyle,
+} from 'react-native';
 import { SafeAreaProvider, useSafeAreaInsets } from 'react-native-safe-area-context';
 import { LinearGradient } from 'expo-linear-gradient';
 import { Ionicons } from '@expo/vector-icons';
@@ -63,7 +71,8 @@ import type { AddTrack, Track } from 'react-native-track-player';
 /* -------------------------------------------------------------------------- */
 
 type IconName = ComponentProps<typeof Ionicons>['name'];
-type FilterKey = 'playlists' | 'songs' | 'downloaded';
+type FilterKey = 'songs' | 'downloaded';
+type TabKey = 'songs' | 'playlists';
 type SortKey = 'custom' | 'added' | 'recent' | 'title' | 'artist';
 
 interface LibraryTrack {
@@ -118,7 +127,6 @@ const ACCENTS: readonly AccentOption[] = [
 const ICON_SWITCH_DELAY_MS = 900;
 
 const FILTERS: readonly { key: FilterKey; label: string }[] = [
-  { key: 'playlists', label: 'Playlists' },
   { key: 'songs', label: 'Songs' },
   { key: 'downloaded', label: 'Downloaded' },
 ];
@@ -157,6 +165,8 @@ const MAX_PLAYLIST_NAME = 60;
 
 const MINI_PLAYER_HEIGHT = 64;
 const MINI_PLAYER_BOTTOM_OFFSET = 8;
+const TAB_BAR_HEIGHT = 56;
+const ROW_HEIGHT = 56;
 const MINI_PLAYER_SIDE_MARGIN = 8;
 const TRAY_HEIGHT = 72;
 
@@ -417,6 +427,38 @@ function rebaseUri(stored: string): string {
   return name ? `${DOC_DIR}${name}` : stored;
 }
 
+/**
+ * Finds a stored file even if it was moved between the app folder, Songs, Artwork or Inbox,
+ * and moves loose files from the main folder into the tidy subfolder.
+ */
+async function locateFile(stored: string, preferredDir: string): Promise<string | null> {
+  const rebased = rebaseUri(stored);
+  const name = rebased.split('/').pop() ?? '';
+  if (!name) {
+    return null;
+  }
+  const candidates = [rebased, `${preferredDir}${name}`, `${DOC_DIR}${name}`, `${INBOX_URI}${name}`];
+  for (const candidate of candidates) {
+    if (!(await fileExists(candidate))) {
+      continue;
+    }
+    if (candidate.startsWith(preferredDir)) {
+      return candidate;
+    }
+    const target = `${preferredDir}${name}`;
+    if (!(await fileExists(target))) {
+      try {
+        await FileSystem.moveAsync({ from: candidate, to: target });
+        return target;
+      } catch (error) {
+        console.warn(`Could not move ${name}`, error);
+      }
+    }
+    return candidate;
+  }
+  return null;
+}
+
 interface StoredTrack {
   id: string;
   title: string;
@@ -478,15 +520,14 @@ async function loadLibrary(): Promise<LibraryTrack[]> {
         changed = true;
         continue;
       }
-      const uri = rebaseUri(item.uri);
-      if (!(await fileExists(uri))) {
+      const uri = await locateFile(item.uri, SONGS_DIR);
+      if (!uri) {
         changed = true;
         continue;
       }
       let artwork: string | null = null;
       if (item.artwork) {
-        const candidate = rebaseUri(item.artwork);
-        artwork = (await fileExists(candidate)) ? candidate : null;
+        artwork = await locateFile(item.artwork, ART_DIR);
       }
       if (uri !== item.uri || artwork !== item.artwork) {
         changed = true;
@@ -558,8 +599,7 @@ async function loadPlaylists(validIds: ReadonlySet<string>): Promise<Playlist[]>
       }
       let cover: string | null = null;
       if (typeof item.cover === 'string' && item.cover) {
-        const candidate = rebaseUri(item.cover);
-        cover = (await fileExists(candidate)) ? candidate : null;
+        cover = await locateFile(item.cover, ART_DIR);
         if (cover !== item.cover) {
           changed = true;
         }
@@ -613,7 +653,7 @@ async function findDroppedFiles(
     }
   }
   const found: IncomingFile[] = [];
-  for (const directory of [DOC_DIR, INBOX_URI]) {
+  for (const directory of [DOC_DIR, INBOX_URI, SONGS_DIR, ART_DIR]) {
     let names: string[];
     try {
       names = await FileSystem.readDirectoryAsync(directory);
@@ -1145,6 +1185,7 @@ interface LibraryHeaderProps {
   trayOpen: boolean;
   importing: boolean;
   filter: FilterKey | null;
+  tab: TabKey;
   onToggleTray: () => void;
   onImport: () => void;
   onSelectFilter: (key: FilterKey) => void;
@@ -1154,6 +1195,7 @@ function LibraryHeader({
   trayOpen,
   importing,
   filter,
+  tab,
   onToggleTray,
   onImport,
   onSelectFilter,
@@ -1164,7 +1206,7 @@ function LibraryHeader({
   return (
     <View style={[styles.header, { paddingTop: insets.top + 4 }]}>
       <View style={styles.headerRow}>
-        <Text style={styles.headerTitle}>Your Library</Text>
+        <Text style={styles.headerTitle}>{tab === 'songs' ? 'Your Library' : 'Playlists'}</Text>
         <View style={styles.headerActions}>
           <IconButton
             name={trayOpen ? 'color-palette' : 'color-palette-outline'}
@@ -1189,20 +1231,22 @@ function LibraryHeader({
         </View>
       </View>
       <ThemeTray open={trayOpen} />
-      <ScrollView
-        horizontal
-        showsHorizontalScrollIndicator={false}
-        contentContainerStyle={styles.chipRow}
-      >
-        {FILTERS.map((item) => (
-          <FilterChip
-            key={item.key}
-            label={item.label}
-            selected={filter === item.key}
-            onPress={() => onSelectFilter(item.key)}
-          />
-        ))}
-      </ScrollView>
+      {tab === 'songs' ? (
+        <ScrollView
+          horizontal
+          showsHorizontalScrollIndicator={false}
+          contentContainerStyle={styles.chipRow}
+        >
+          {FILTERS.map((item) => (
+            <FilterChip
+              key={item.key}
+              label={item.label}
+              selected={filter === item.key}
+              onPress={() => onSelectFilter(item.key)}
+            />
+          ))}
+        </ScrollView>
+      ) : null}
     </View>
   );
 }
@@ -1356,7 +1400,7 @@ function MiniPlayer({ track, onOpen, onToggleLike }: MiniPlayerProps) {
     <View
       style={[
         styles.miniWrap,
-        { bottom: insets.bottom + MINI_PLAYER_BOTTOM_OFFSET },
+        { bottom: insets.bottom + TAB_BAR_HEIGHT + MINI_PLAYER_BOTTOM_OFFSET },
       ]}
     >
       <Pressable
@@ -1793,34 +1837,219 @@ function SortSheet({ title, options, value, onSelect, onClose }: SortSheetProps)
   );
 }
 
+/* ----------------------------- Drag to reorder ---------------------------- */
+
+interface DragState {
+  from: number;
+  to: number;
+}
+
+/**
+ * Drag-to-reorder for rows of a fixed height inside a FlatList. The dragged row follows the
+ * finger, the rows in between slide out of the way, and the list scrolls near its edges.
+ */
+function useDragReorder<T>(count: number, onCommit: (from: number, to: number) => void) {
+  const [drag, setDrag] = useState<DragState | null>(null);
+  const dragY = useRef(new Animated.Value(0)).current;
+  const info = useRef<{ from: number; to: number; dy: number; moveY: number; startScroll: number } | null>(
+    null,
+  );
+  const dragFromRef = useRef<number | null>(null);
+  dragFromRef.current = drag?.from ?? null;
+  const countRef = useRef(count);
+  countRef.current = count;
+  const commitRef = useRef(onCommit);
+  commitRef.current = onCommit;
+  const listRef = useRef<FlatList<T>>(null);
+  const boxRef = useRef<ComponentRef<typeof View>>(null);
+  const scrollOffset = useRef(0);
+  const contentHeight = useRef(0);
+  const viewHeight = useRef(0);
+  const boxRect = useRef({ top: 0, height: 0 });
+  const timer = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  const stopAutoScroll = useCallback(() => {
+    if (timer.current !== null) {
+      clearInterval(timer.current);
+      timer.current = null;
+    }
+  }, []);
+
+  useEffect(() => stopAutoScroll, [stopAutoScroll]);
+
+  const refresh = useCallback(() => {
+    const current = info.current;
+    if (!current) {
+      return;
+    }
+    const total = current.dy + (scrollOffset.current - current.startScroll);
+    dragY.setValue(total);
+    const to = Math.max(
+      0,
+      Math.min(countRef.current - 1, current.from + Math.round(total / ROW_HEIGHT)),
+    );
+    if (to !== current.to) {
+      current.to = to;
+      setDrag({ from: current.from, to });
+    }
+  }, [dragY]);
+
+  const startDrag = useCallback(
+    (index: number) => {
+      info.current = { from: index, to: index, dy: 0, moveY: 0, startScroll: scrollOffset.current };
+      dragY.setValue(0);
+      setDrag({ from: index, to: index });
+      boxRef.current?.measureInWindow((_x: number, y: number, _width: number, height: number) => {
+        boxRect.current = { top: y, height };
+      });
+      stopAutoScroll();
+      timer.current = setInterval(() => {
+        const current = info.current;
+        const { top, height } = boxRect.current;
+        if (!current || current.moveY === 0 || height === 0) {
+          return;
+        }
+        const edge = 90;
+        let delta = 0;
+        if (current.moveY < top + edge) {
+          delta = -14;
+        } else if (current.moveY > top + height - edge) {
+          delta = 14;
+        }
+        if (delta === 0) {
+          return;
+        }
+        const max = Math.max(0, contentHeight.current - viewHeight.current);
+        const next = Math.max(0, Math.min(max, scrollOffset.current + delta));
+        if (next !== scrollOffset.current) {
+          scrollOffset.current = next;
+          listRef.current?.scrollToOffset({ offset: next, animated: false });
+          refresh();
+        }
+      }, 16);
+    },
+    [dragY, refresh, stopAutoScroll],
+  );
+
+  const moveDrag = useCallback(
+    (dy: number, moveY: number) => {
+      const current = info.current;
+      if (!current) {
+        return;
+      }
+      current.dy = dy;
+      current.moveY = moveY;
+      refresh();
+    },
+    [refresh],
+  );
+
+  const endDrag = useCallback(() => {
+    const current = info.current;
+    info.current = null;
+    stopAutoScroll();
+    dragY.setValue(0);
+    setDrag(null);
+    if (current && current.to !== current.from) {
+      commitRef.current(current.from, current.to);
+    }
+  }, [dragY, stopAutoScroll]);
+
+  const shiftFor = useCallback(
+    (index: number): number => {
+      if (!drag || index === drag.from) {
+        return 0;
+      }
+      if (drag.from < drag.to && index > drag.from && index <= drag.to) {
+        return -ROW_HEIGHT;
+      }
+      if (drag.from > drag.to && index < drag.from && index >= drag.to) {
+        return ROW_HEIGHT;
+      }
+      return 0;
+    },
+    [drag],
+  );
+
+  const cell = useMemo(
+    () =>
+      function DragCell(props: {
+        children?: ReactNode;
+        index: number;
+        style?: StyleProp<ViewStyle>;
+        onLayout?: (event: LayoutChangeEvent) => void;
+      }) {
+        return (
+          <View
+            style={[props.style, props.index === dragFromRef.current && styles.dragCell]}
+            onLayout={props.onLayout}
+          >
+            {props.children}
+          </View>
+        );
+      },
+    [],
+  );
+
+  const listProps = {
+    extraData: drag,
+    scrollEnabled: drag === null,
+    scrollEventThrottle: 16,
+    CellRendererComponent: cell,
+    onScroll: (event: NativeSyntheticEvent<NativeScrollEvent>) => {
+      scrollOffset.current = event.nativeEvent.contentOffset.y;
+    },
+    onContentSizeChange: (_width: number, height: number) => {
+      contentHeight.current = height;
+    },
+    onLayout: (event: LayoutChangeEvent) => {
+      viewHeight.current = event.nativeEvent.layout.height;
+    },
+  };
+
+  return { drag, dragY, startDrag, moveDrag, endDrag, shiftFor, listRef, boxRef, listProps };
+}
+
 /* ----------------------------- Reorder helpers ---------------------------- */
 
 interface ReorderRowProps {
+  index: number;
   title: string;
   artist: string;
   artwork: string | null;
-  canUp: boolean;
-  canDown: boolean;
-  onTop: () => void;
-  onUp: () => void;
-  onDown: () => void;
-  onRemove?: () => void;
+  dragging: boolean;
+  shift: number;
+  dragY: Animated.Value;
+  onStart: (index: number) => void;
+  onMove: (dy: number, moveY: number) => void;
+  onEnd: () => void;
+  onRemove: () => void;
 }
 
-function ReorderRow({
-  title,
-  artist,
-  artwork,
-  canUp,
-  canDown,
-  onTop,
-  onUp,
-  onDown,
-  onRemove,
-}: ReorderRowProps) {
-  const dim = '#5A5A5A';
+function ReorderRow(props: ReorderRowProps) {
+  const { title, artist, artwork, dragging, shift, dragY, onRemove } = props;
+  const propsRef = useRef(props);
+  propsRef.current = props;
+  const responder = useRef(
+    PanResponder.create({
+      onStartShouldSetPanResponder: () => true,
+      onMoveShouldSetPanResponder: () => true,
+      onPanResponderTerminationRequest: () => false,
+      onPanResponderGrant: () => propsRef.current.onStart(propsRef.current.index),
+      onPanResponderMove: (_event, gesture) => propsRef.current.onMove(gesture.dy, gesture.moveY),
+      onPanResponderRelease: () => propsRef.current.onEnd(),
+      onPanResponderTerminate: () => propsRef.current.onEnd(),
+    }),
+  ).current;
+
   return (
-    <View style={styles.reorderRow}>
+    <Animated.View
+      style={[
+        styles.reorderRow,
+        dragging && styles.reorderRowDragging,
+        { transform: [{ translateY: dragging ? dragY : shift }] },
+      ]}
+    >
       <Artwork uri={artwork} size={40} radius={4} iconSize={18} />
       <View style={styles.rowText}>
         <Text numberOfLines={1} style={styles.rowTitle}>
@@ -1831,39 +2060,54 @@ function ReorderRow({
         </Text>
       </View>
       <IconButton
-        name="arrow-up-circle-outline"
+        name="close"
         size={22}
-        color={canUp ? PALETTE.text : dim}
-        label={`Move ${title} to the top`}
-        onPress={onTop}
+        color={PALETTE.textSecondary}
+        label={`Remove ${title}`}
+        onPress={onRemove}
         style={styles.smallIcon}
       />
-      <IconButton
-        name="chevron-up"
-        size={22}
-        color={canUp ? PALETTE.text : dim}
-        label={`Move ${title} up`}
-        onPress={onUp}
-        style={styles.smallIcon}
-      />
-      <IconButton
-        name="chevron-down"
-        size={22}
-        color={canDown ? PALETTE.text : dim}
-        label={`Move ${title} down`}
-        onPress={onDown}
-        style={styles.smallIcon}
-      />
-      {onRemove ? (
-        <IconButton
-          name="close"
-          size={22}
-          color={PALETTE.textSecondary}
-          label={`Remove ${title}`}
-          onPress={onRemove}
-          style={styles.smallIcon}
-        />
-      ) : null}
+      <View
+        {...responder.panHandlers}
+        accessible
+        accessibilityLabel={`Drag ${title} to reorder`}
+        style={styles.dragHandle}
+      >
+        <Ionicons name="reorder-three" size={28} color={PALETTE.textSecondary} />
+      </View>
+    </Animated.View>
+  );
+}
+
+function TabBar({ tab, onSelect }: { tab: TabKey; onSelect: (tab: TabKey) => void }) {
+  const insets = useSafeAreaInsets();
+  const { accent } = useTheme();
+  const items: { key: TabKey; label: string; on: IconName; off: IconName }[] = [
+    { key: 'songs', label: 'Songs', on: 'musical-notes', off: 'musical-notes-outline' },
+    { key: 'playlists', label: 'Playlists', on: 'albums', off: 'albums-outline' },
+  ];
+  return (
+    <View style={[styles.tabBar, { height: TAB_BAR_HEIGHT + insets.bottom, paddingBottom: insets.bottom }]}>
+      {items.map((item) => {
+        const selected = tab === item.key;
+        return (
+          <Pressable
+            key={item.key}
+            onPress={() => onSelect(item.key)}
+            accessibilityRole="tab"
+            accessibilityState={{ selected }}
+            accessibilityLabel={item.label}
+            style={({ pressed }) => [styles.tabItem, pressed && styles.pressed]}
+          >
+            <Ionicons
+              name={selected ? item.on : item.off}
+              size={24}
+              color={selected ? accent : PALETTE.textSecondary}
+            />
+            <Text style={[styles.tabLabel, selected && { color: accent }]}>{item.label}</Text>
+          </Pressable>
+        );
+      })}
     </View>
   );
 }
@@ -1940,6 +2184,21 @@ function QueueSheet({ onClose }: { onClose: () => void }) {
 
   const base = activeIndex + 1;
   const upcoming = queue.slice(base);
+  const commitQueueDrag = useCallback(
+    (from: number, to: number) => {
+      setQueue((previous) => {
+        const next = [...previous];
+        const [moved] = next.splice(base + from, 1);
+        if (moved) {
+          next.splice(base + to, 0, moved);
+        }
+        return next;
+      });
+      void run(() => TrackPlayer.move(base + from, base + to));
+    },
+    [base, run],
+  );
+  const dnd = useDragReorder<Track>(upcoming.length, commitQueueDrag);
   const nowTrack = activeIndex >= 0 ? queue[activeIndex] : undefined;
 
   const renderItem = ({ item, index }: ListRenderItemInfo<Track>) => {
@@ -1950,14 +2209,16 @@ function QueueSheet({ onClose }: { onClose: () => void }) {
     if (editing) {
       return (
         <ReorderRow
+          index={index}
           title={title}
           artist={artist}
           artwork={artwork}
-          canUp={index > 0}
-          canDown={index < upcoming.length - 1}
-          onTop={() => void run(() => TrackPlayer.move(absolute, base))}
-          onUp={() => void run(() => TrackPlayer.move(absolute, absolute - 1))}
-          onDown={() => void run(() => TrackPlayer.move(absolute, absolute + 1))}
+          dragging={dnd.drag?.from === index}
+          shift={dnd.shiftFor(index)}
+          dragY={dnd.dragY}
+          onStart={dnd.startDrag}
+          onMove={dnd.moveDrag}
+          onEnd={dnd.endDrag}
           onRemove={() => void run(() => TrackPlayer.remove(absolute))}
         />
       );
@@ -2024,14 +2285,17 @@ function QueueSheet({ onClose }: { onClose: () => void }) {
           Nothing is queued next. Use Play next or Add to queue from any song menu.
         </Text>
       ) : (
-        <FlatList
-          data={upcoming}
-          keyExtractor={(item, index) => `${base + index}-${String(item.id)}`}
-          renderItem={renderItem}
-          extraData={editing}
-          style={styles.sheetListTall}
-          keyboardShouldPersistTaps="handled"
-        />
+        <View ref={dnd.boxRef} collapsable={false} style={styles.sheetListTall}>
+          <FlatList
+            ref={dnd.listRef}
+            data={upcoming}
+            {...dnd.listProps}
+            extraData={{ editing, drag: dnd.drag }}
+            keyExtractor={(item, index) => `${base + index}-${String(item.id)}`}
+            renderItem={renderItem}
+            keyboardShouldPersistTaps="handled"
+          />
+        </View>
       )}
       <View style={styles.sheetActions}>
         <Pressable
@@ -2711,6 +2975,7 @@ function AppShell() {
   const [hydrated, setHydrated] = useState(false);
   const [playerError, setPlayerError] = useState<string | null>(null);
   const [filter, setFilter] = useState<FilterKey | null>(null);
+  const [tab, setTab] = useState<TabKey>('songs');
   const [likedOnly, setLikedOnly] = useState(false);
   const [trayOpen, setTrayOpen] = useState(false);
   const [importing, setImporting] = useState(false);
@@ -2899,8 +3164,8 @@ function AppShell() {
     [commitPlaylists],
   );
 
-  const moveTrackInPlaylist = useCallback(
-    (playlistId: string, trackId: string, direction: 'top' | 'up' | 'down') => {
+  const moveTrackToIndex = useCallback(
+    (playlistId: string, trackId: string, toIndex: number) => {
       commitPlaylists((previous) =>
         previous.map((playlist) => {
           if (playlist.id !== playlistId) {
@@ -2908,16 +3173,11 @@ function AppShell() {
           }
           const ids = [...playlist.trackIds];
           const from = ids.indexOf(trackId);
-          if (from < 0) {
-            return playlist;
-          }
-          const to =
-            direction === 'top' ? 0 : direction === 'up' ? from - 1 : from + 1;
-          if (to < 0 || to >= ids.length || to === from) {
+          if (from < 0 || toIndex < 0 || toIndex >= ids.length || toIndex === from) {
             return playlist;
           }
           ids.splice(from, 1);
-          ids.splice(to, 0, trackId);
+          ids.splice(toIndex, 0, trackId);
           return { ...playlist, trackIds: ids };
         }),
       );
@@ -3423,26 +3683,26 @@ function AppShell() {
     }
   }, [repeatMode]);
 
-  const selectFilter = useCallback(
-    (key: FilterKey) => {
+  const selectFilter = useCallback((key: FilterKey) => {
+    setLikedOnly(false);
+    setFilter((previous) => (previous === key ? null : key));
+  }, []);
+
+  const selectTab = useCallback((next: TabKey) => {
+    setTab(next);
+    setOpenPlaylistId(null);
+    if (next === 'playlists') {
       setLikedOnly(false);
-      if (key === 'playlists' && openPlaylistId !== null) {
-        setOpenPlaylistId(null);
-        return;
-      }
-      setOpenPlaylistId(null);
-      setFilter((previous) => (previous === key ? null : key));
-    },
-    [openPlaylistId],
-  );
+    }
+  }, []);
 
   const openLiked = useCallback(() => {
-    setOpenPlaylistId(null);
     setFilter(null);
     setLikedOnly((previous) => !previous);
   }, []);
 
   const showLiked = useCallback(() => {
+    setTab('songs');
     setOpenPlaylistId(null);
     setFilter(null);
     setLikedOnly(true);
@@ -3450,7 +3710,7 @@ function AppShell() {
 
   const showPlaylist = useCallback((id: string) => {
     setLikedOnly(false);
-    setFilter('playlists');
+    setTab('playlists');
     setOpenPlaylistId(id);
   }, []);
 
@@ -3565,26 +3825,39 @@ function AppShell() {
   );
   const toggleTray = useCallback(() => setTrayOpen((previous) => !previous), []);
 
-  const inPlaylistsTab = filter === 'playlists' && openPlaylist === null;
-  const showGrid = filter === null && openPlaylist === null;
+  const inPlaylistsTab = tab === 'playlists' && openPlaylist === null;
+  const showGrid = tab === 'songs' && filter === null;
   const showDownloaded = filter === 'downloaded';
 
   const reorderActive = reordering && openPlaylist !== null;
 
+  const commitDrag = useCallback(
+    (from: number, to: number) => {
+      const moved = visibleRef.current[from];
+      if (moved && openPlaylistId !== null) {
+        moveTrackToIndex(openPlaylistId, moved.id, to);
+      }
+    },
+    [openPlaylistId, moveTrackToIndex],
+  );
+  const dnd = useDragReorder<LibraryTrack>(visibleTracks.length, commitDrag);
+  const { drag, dragY, startDrag, moveDrag, endDrag, shiftFor } = dnd;
+
   const renderItem = useCallback(
     ({ item, index }: ListRenderItemInfo<LibraryTrack>) => {
-      if (reorderActive && openPlaylistId !== null) {
-        const last = visibleRef.current.length - 1;
+      if (reorderActive) {
         return (
           <ReorderRow
+            index={index}
             title={item.title}
             artist={item.artist}
             artwork={item.artwork}
-            canUp={index > 0}
-            canDown={index < last}
-            onTop={() => moveTrackInPlaylist(openPlaylistId, item.id, 'top')}
-            onUp={() => moveTrackInPlaylist(openPlaylistId, item.id, 'up')}
-            onDown={() => moveTrackInPlaylist(openPlaylistId, item.id, 'down')}
+            dragging={drag?.from === index}
+            shift={shiftFor(index)}
+            dragY={dragY}
+            onStart={startDrag}
+            onMove={moveDrag}
+            onEnd={endDrag}
             onRemove={() => removeFromOpenPlaylist(item.id)}
           />
         );
@@ -3603,8 +3876,12 @@ function AppShell() {
     },
     [
       reorderActive,
-      openPlaylistId,
-      moveTrackInPlaylist,
+      drag,
+      shiftFor,
+      dragY,
+      startDrag,
+      moveDrag,
+      endDrag,
       removeFromOpenPlaylist,
       activeTrack?.id,
       playing,
@@ -3786,8 +4063,8 @@ function AppShell() {
   );
 
   const listBottomPadding = currentTrack
-    ? MINI_PLAYER_HEIGHT + MINI_PLAYER_BOTTOM_OFFSET + insets.bottom + 24
-    : insets.bottom + 24;
+    ? MINI_PLAYER_HEIGHT + MINI_PLAYER_BOTTOM_OFFSET + 24
+    : 24;
 
   return (
     <View style={styles.screen}>
@@ -3796,6 +4073,7 @@ function AppShell() {
         trayOpen={trayOpen}
         importing={importing}
         filter={filter}
+        tab={tab}
         onToggleTray={toggleTray}
         onImport={() => void importSongs()}
         onSelectFilter={selectFilter}
@@ -3815,19 +4093,24 @@ function AppShell() {
           keyboardShouldPersistTaps="handled"
         />
       ) : (
-        <FlatList
-          key="tracks"
-          data={visibleTracks}
-          keyExtractor={keyExtractor}
-          renderItem={renderItem}
-          ListHeaderComponent={listHeader}
-          ListEmptyComponent={emptyState}
-          contentContainerStyle={{ paddingBottom: listBottomPadding }}
-          initialNumToRender={14}
-          windowSize={9}
-          keyboardShouldPersistTaps="handled"
-        />
+        <View ref={dnd.boxRef} collapsable={false} style={styles.flex}>
+          <FlatList
+            key="tracks"
+            ref={dnd.listRef}
+            data={visibleTracks}
+            {...dnd.listProps}
+            keyExtractor={keyExtractor}
+            renderItem={renderItem}
+            ListHeaderComponent={listHeader}
+            ListEmptyComponent={emptyState}
+            contentContainerStyle={{ paddingBottom: listBottomPadding }}
+            initialNumToRender={14}
+            windowSize={9}
+            keyboardShouldPersistTaps="handled"
+          />
+        </View>
       )}
+      <TabBar tab={tab} onSelect={selectTab} />
       {currentTrack ? (
         <MiniPlayer track={currentTrack} onOpen={openNowPlaying} onToggleLike={toggleLike} />
       ) : null}
@@ -3877,6 +4160,7 @@ function AppShell() {
           text={toast.text}
           bottom={
             insets.bottom +
+            TAB_BAR_HEIGHT +
             (currentTrack ? MINI_PLAYER_BOTTOM_OFFSET + MINI_PLAYER_HEIGHT + 12 : 24)
           }
           onDone={clearToast}
@@ -4220,10 +4504,21 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     gap: 8,
     paddingLeft: 16,
-    paddingRight: 8,
-    paddingVertical: 6,
+    paddingRight: 4,
+    height: ROW_HEIGHT,
   },
   smallIcon: { width: 34, height: 34 },
+  dragHandle: { width: 44, height: ROW_HEIGHT, alignItems: 'center', justifyContent: 'center' },
+  dragCell: { zIndex: 10 },
+  reorderRowDragging: { backgroundColor: '#2A2A2A' },
+  tabBar: {
+    flexDirection: 'row',
+    backgroundColor: '#000000',
+    borderTopWidth: StyleSheet.hairlineWidth,
+    borderTopColor: '#2A2A2A',
+  },
+  tabItem: { flex: 1, alignItems: 'center', justifyContent: 'center', gap: 2 },
+  tabLabel: { color: PALETTE.textSecondary, fontSize: 11, fontWeight: '700' },
   toastWrap: { position: 'absolute', left: 0, right: 0, alignItems: 'center' },
   toast: {
     backgroundColor: '#2A2A2A',
