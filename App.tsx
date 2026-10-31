@@ -83,6 +83,7 @@ interface LibraryTrack {
   artwork: string | null;
   liked: boolean;
   sourceName: string;
+  album: string;
 }
 
 interface Playlist {
@@ -151,6 +152,8 @@ const AUDIO_EXTENSIONS: ReadonlySet<string> = new Set([
 ]);
 const IMAGE_EXTENSIONS: ReadonlySet<string> = new Set(['jpg', 'jpeg', 'png', 'webp', 'heic', 'heif']);
 const DEFAULT_ARTIST = 'Unknown Artist';
+/** Shown on car displays and lock screens when a song has no album, instead of N/A. */
+const DEFAULT_ALBUM = 'Local Files';
 
 const SORT_LABELS: Record<SortKey, string> = {
   custom: 'Custom order',
@@ -378,17 +381,21 @@ function reportSkipped(skipped: string[]): void {
   }
 }
 
-function parseTrackNames(fileName: string): { title: string; artist: string } {
+/** "Artist - Title - Album", "Artist - Title" or just "Title". */
+function parseTrackNames(fileName: string): { title: string; artist: string; album: string } {
   const base = fileName.replace(/\.[A-Za-z0-9]{1,5}$/, '').replace(/_/g, ' ').trim();
-  const parts = base.split(' - ');
-  if (parts.length >= 2) {
-    const artist = parts[0].trim();
-    const title = parts.slice(1).join(' - ').trim();
-    if (artist.length > 0 && title.length > 0) {
-      return { title, artist };
-    }
+  const parts = base.split(' - ').map((part) => part.trim());
+  if (parts.length >= 3 && parts[0] && parts[1] && parts[2]) {
+    return {
+      artist: parts[0],
+      title: parts.slice(1, -1).join(' - '),
+      album: parts[parts.length - 1],
+    };
   }
-  return { title: base.length > 0 ? base : 'Untitled', artist: DEFAULT_ARTIST };
+  if (parts.length >= 2 && parts[0] && parts[1]) {
+    return { artist: parts[0], title: parts.slice(1).join(' - '), album: '' };
+  }
+  return { title: base.length > 0 ? base : 'Untitled', artist: DEFAULT_ARTIST, album: '' };
 }
 
 function toPlayerTrack(track: LibraryTrack): AddTrack {
@@ -397,6 +404,7 @@ function toPlayerTrack(track: LibraryTrack): AddTrack {
     url: track.uri,
     title: track.title,
     artist: track.artist,
+    album: track.album || DEFAULT_ALBUM,
     artwork: track.artwork ?? undefined,
   };
 }
@@ -467,6 +475,7 @@ interface StoredTrack {
   artwork: string | null;
   liked?: boolean;
   sourceName?: string;
+  album?: string;
 }
 
 function isStoredTrack(value: unknown): value is StoredTrack {
@@ -540,6 +549,7 @@ async function loadLibrary(): Promise<LibraryTrack[]> {
         artwork,
         liked: item.liked === true,
         sourceName: typeof item.sourceName === 'string' ? item.sourceName : '',
+        album: typeof item.album === 'string' ? item.album : '',
       });
     }
     if (changed) {
@@ -867,6 +877,7 @@ async function syncQueueMetadata(track: LibraryTrack): Promise<void> {
       await TrackPlayer.updateMetadataForTrack(index, {
         title: track.title,
         artist: track.artist,
+        album: track.album || DEFAULT_ALBUM,
         artwork: track.artwork ?? undefined,
       });
     }
@@ -1246,6 +1257,38 @@ function LibraryHeader({
             />
           ))}
         </ScrollView>
+      ) : null}
+    </View>
+  );
+}
+
+function SearchBar({ value, onChange }: { value: string; onChange: (text: string) => void }) {
+  const { accent } = useTheme();
+  return (
+    <View style={styles.searchBar}>
+      <Ionicons name="search" size={18} color={PALETTE.textSecondary} />
+      <TextInput
+        value={value}
+        onChangeText={onChange}
+        style={styles.searchInput}
+        placeholder="Search your songs"
+        placeholderTextColor={PALETTE.textSecondary}
+        selectionColor={accent}
+        autoCapitalize="none"
+        autoCorrect={false}
+        returnKeyType="search"
+        clearButtonMode="never"
+        accessibilityLabel="Search your songs"
+      />
+      {value.length > 0 ? (
+        <Pressable
+          onPress={() => onChange('')}
+          hitSlop={10}
+          accessibilityRole="button"
+          accessibilityLabel="Clear search"
+        >
+          <Ionicons name="close-circle" size={18} color={PALETTE.textSecondary} />
+        </Pressable>
       ) : null}
     </View>
   );
@@ -2489,7 +2532,7 @@ interface OptionsOverlayProps {
   currentPlaylistName: string | null;
   onClose: () => void;
   onToggleLike: (id: string) => void;
-  onSaveDetails: (id: string, title: string, artist: string) => void;
+  onSaveDetails: (id: string, title: string, artist: string, album: string) => void;
   onPickArtwork: (id: string) => void;
   onRemove: (id: string) => void;
   onTogglePlaylist: (playlistId: string, trackId: string) => void;
@@ -2527,6 +2570,7 @@ function OptionsSheet({
   const [mode, setMode] = useState<OptionsMode>('menu');
   const [title, setTitle] = useState(track.title);
   const [artist, setArtist] = useState(track.artist);
+  const [album, setAlbum] = useState(track.album);
 
   const runAndClose = (action: () => void) => () => {
     onClose();
@@ -2567,7 +2611,7 @@ function OptionsSheet({
             ) : null}
             <OptionRow
               icon="create-outline"
-              label="Edit title and artist"
+              label="Edit details"
               onPress={() => setMode('edit')}
             />
             <OptionRow
@@ -2605,6 +2649,17 @@ function OptionsSheet({
               placeholderTextColor={PALETTE.textSecondary}
               selectionColor={accent}
               autoCapitalize="words"
+              returnKeyType="next"
+            />
+            <Text style={styles.fieldLabel}>Album</Text>
+            <TextInput
+              value={album}
+              onChangeText={setAlbum}
+              style={styles.input}
+              placeholder={DEFAULT_ALBUM}
+              placeholderTextColor={PALETTE.textSecondary}
+              selectionColor={accent}
+              autoCapitalize="words"
               returnKeyType="done"
             />
             <View style={styles.editActions}>
@@ -2617,7 +2672,7 @@ function OptionsSheet({
               </Pressable>
               <Pressable
                 onPress={() => {
-                  onSaveDetails(track.id, title, artist);
+                  onSaveDetails(track.id, title, artist, album);
                   onClose();
                 }}
                 style={({ pressed }) => [
@@ -2733,6 +2788,7 @@ interface NowPlayingProps {
   onCycleRepeat: () => void;
   onMore: (id: string) => void;
   onOpenQueue: () => void;
+  overlayOpen: boolean;
 }
 
 function NowPlayingSheet(props: NowPlayingProps) {
@@ -2765,6 +2821,7 @@ function NowPlayingContent({
   onCycleRepeat,
   onMore,
   onOpenQueue,
+  overlayOpen,
 }: NowPlayingContentProps) {
   const { accent, onAccent } = useTheme();
   const insets = useSafeAreaInsets();
@@ -2870,6 +2927,9 @@ function NowPlayingContent({
           </View>
 
           <View style={styles.npSliderBlock}>
+            {overlayOpen ? (
+              <View style={styles.npSlider} />
+            ) : (
             <Slider
               style={styles.npSlider}
               minimumValue={0}
@@ -2883,6 +2943,7 @@ function NowPlayingContent({
               onSlidingComplete={handleSlidingComplete}
               accessibilityLabel="Playback position"
             />
+            )}
             <View style={styles.npTimes}>
               <Text style={styles.npTime}>{formatTime(elapsed)}</Text>
               <Text style={styles.npTime}>{formatTime(duration)}</Text>
@@ -2986,6 +3047,7 @@ function AppShell() {
   const [playlists, setPlaylists] = useState<Playlist[]>([]);
   const [openPlaylistId, setOpenPlaylistId] = useState<string | null>(null);
   const [playlistSheet, setPlaylistSheet] = useState<PlaylistSheetState | null>(null);
+  const [query, setQuery] = useState('');
   const [librarySort, setLibrarySort] = useState<SortKey>('added');
   const [sortSheet, setSortSheet] = useState<'library' | 'playlist' | null>(null);
   const [reordering, setReordering] = useState(false);
@@ -3239,9 +3301,15 @@ function AppShell() {
         .filter((track): track is LibraryTrack => track !== undefined);
       return sortTracks(members, openPlaylist.sort);
     }
-    const base = likedOnly ? tracks.filter((track) => track.liked) : tracks;
+    let base = likedOnly ? tracks.filter((track) => track.liked) : tracks;
+    const needle = query.trim().toLowerCase();
+    if (needle) {
+      base = base.filter((track) =>
+        `${track.title} ${track.artist} ${track.album}`.toLowerCase().includes(needle),
+      );
+    }
     return sortTracks(base, librarySort);
-  }, [tracks, likedOnly, openPlaylist, librarySort]);
+  }, [tracks, likedOnly, openPlaylist, librarySort, query]);
   visibleRef.current = visibleTracks;
 
   const playlistArtwork = useMemo(() => {
@@ -3336,6 +3404,7 @@ function AppShell() {
               artwork,
               liked: false,
               sourceName: stripExtension(file.name),
+              album: names.album,
             });
           } catch {
             skipped.push(file.name);
@@ -3572,7 +3641,7 @@ function AppShell() {
   );
 
   const saveDetails = useCallback(
-    (id: string, title: string, artist: string) => {
+    (id: string, title: string, artist: string, album: string) => {
       const existing = tracksRef.current.find((track) => track.id === id);
       if (!existing) {
         return;
@@ -3581,6 +3650,7 @@ function AppShell() {
         ...existing,
         title: title.trim() || existing.title,
         artist: artist.trim() || DEFAULT_ARTIST,
+        album: album.trim(),
       };
       commitTracks((previous) => previous.map((track) => (track.id === id ? updated : track)));
       void syncQueueMetadata(updated);
@@ -3826,7 +3896,9 @@ function AppShell() {
   const toggleTray = useCallback(() => setTrayOpen((previous) => !previous), []);
 
   const inPlaylistsTab = tab === 'playlists' && openPlaylist === null;
-  const showGrid = tab === 'songs' && filter === null;
+  const searching = query.trim().length > 0;
+  const showSearch = tab === 'songs' && openPlaylist === null && tracks.length > 0;
+  const showGrid = tab === 'songs' && filter === null && !searching;
   const showDownloaded = filter === 'downloaded';
 
   const reorderActive = reordering && openPlaylist !== null;
@@ -4013,6 +4085,11 @@ function AppShell() {
         <Text style={[styles.primaryButtonText, { color: onAccent }]}>Add songs</Text>
       </Pressable>
     </View>
+  ) : searching ? (
+    <View style={styles.empty}>
+      <Text style={styles.emptyTitle}>No matches</Text>
+      <Text style={styles.emptyBody}>{`Nothing in your songs matches "${query.trim()}".`}</Text>
+    </View>
   ) : likedOnly ? (
     <View style={styles.empty}>
       <Text style={styles.emptyTitle}>No liked songs yet</Text>
@@ -4078,6 +4155,7 @@ function AppShell() {
         onImport={() => void importSongs()}
         onSelectFilter={selectFilter}
       />
+      {showSearch ? <SearchBar value={query} onChange={setQuery} /> : null}
       {playerError ? (
         <Text style={styles.errorBanner}>{`Player unavailable: ${playerError}`}</Text>
       ) : null}
@@ -4125,6 +4203,7 @@ function AppShell() {
         onCycleRepeat={() => void cycleRepeat()}
         onMore={openOptions}
         onOpenQueue={openQueue}
+        overlayOpen={optionsId !== null || queueOpen}
         optionsOverlay={
           <>
             {renderOptions(nowPlayingOpen && optionsId !== null, false)}
@@ -4364,6 +4443,18 @@ const styles = StyleSheet.create({
     height: 56,
   },
   optionLabel: { color: PALETTE.text, fontSize: 16, fontWeight: '500', flexShrink: 1 },
+  searchBar: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    height: 40,
+    marginHorizontal: 16,
+    marginBottom: 4,
+    paddingHorizontal: 12,
+    borderRadius: 8,
+    backgroundColor: '#2A2A2A',
+  },
+  searchInput: { flex: 1, color: PALETTE.text, fontSize: 15, paddingVertical: 0 },
   editForm: { paddingHorizontal: 16, paddingTop: 12 },
   fieldLabel: {
     color: PALETTE.textSecondary,
